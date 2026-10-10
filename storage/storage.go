@@ -1349,6 +1349,15 @@ func (s *Storage) CountByStatus() (map[string]int, error) {
 	return out, rows.Err()
 }
 
+// CountPending 返回等待出口验证的候选数量。
+// 出口查询有硬性额度（ip-api 免费档 45 次/分钟），入池速度必须跟着验证速度走，
+// 否则 pending 只会无限积压。
+func (s *Storage) CountPending() (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM proxies WHERE status = 'pending'`).Scan(&n)
+	return n, err
+}
+
 // SetStatus 更新代理状态（active / degraded / disabled / pending）。
 //
 // pending 表示"连通性已通过、但出口信息尚未验证"的候选代理：

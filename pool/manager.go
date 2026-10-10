@@ -167,6 +167,15 @@ func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
 
 	// 情况1：该协议槽位未满，直接加入
 	if currentCount < maxSlots {
+		// 出口验证速度有限（外部 API 额度），pending 积压超限时不再接收新候选，
+		// 让入池速度跟着验证速度走，避免"看起来在填充、其实一堆未验证候选"。
+		maxPending := m.cfg.MaxPending
+		if maxPending <= 0 {
+			maxPending = 50
+		}
+		if pending, err := m.storage.CountPending(); err == nil && pending >= maxPending {
+			return false, "pending_full"
+		}
 		if err := m.storage.AddProxy(p.Address, p.Protocol); err != nil {
 			return false, "db_error"
 		}

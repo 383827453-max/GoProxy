@@ -220,6 +220,7 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 	var rejectedLatency atomic.Int32
 	var rejectedGeo atomic.Int32
 	var rejectedFull atomic.Int32
+	var rejectedPending atomic.Int32
 
 	// 入池处理函数（两个协程共用）
 	processResult := func(result validator.Result) {
@@ -260,6 +261,8 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 			}
 		} else if reason == "slots_full" {
 			rejectedFull.Add(1)
+		} else if reason == "pending_full" {
+			rejectedPending.Add(1)
 		} else if len(result.ExitLocation) >= 2 {
 			countryCode := result.ExitLocation[:2]
 			for _, blocked := range cfg.BlockedCountries {
@@ -319,9 +322,10 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 
 	// 最终状态
 	finalStatus, _ := poolMgr.GetStatus()
-	log.Printf("[main] 填充完成: 验证%d 通过%d 入池%d | 拒绝[无出口:%d 延迟:%d 地理:%d 满:%d] | 最终: %s HTTP=%d SOCKS5=%d",
+	log.Printf("[main] 填充完成: 验证%d 通过%d 入池%d | 拒绝[无出口:%d 延迟:%d 地理:%d 满:%d 待验证积压:%d] | 最终: %s HTTP=%d SOCKS5=%d",
 		len(candidates), validCount.Load(), addedCount.Load(),
-		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(), rejectedFull.Load(),
+		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(),
+		rejectedFull.Load(), rejectedPending.Load(),
 		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
 }
 

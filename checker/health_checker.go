@@ -127,6 +127,11 @@ func (hc *HealthChecker) RunOnce() {
 	// 半开探测：给已禁用的免费代理一次复活机会
 	revived := hc.reanimateDisabled()
 
+	// 顺带清理长期拿不到出口信息的候选（pending 只应短暂存在）
+	if deleted, err := hc.storage.DeleteStalePending(30); err == nil && deleted > 0 {
+		log.Printf("[health] 🧹 清理超时候选(pending): %d 个", deleted)
+	}
+
 	elapsed := time.Since(start)
 	log.Printf("[health] 完成: 验证%d 有效%d 更新%d 降级%d 移除%d 复活%d 耗时%v",
 		len(proxies), validCount, updateCount, degradedCount, removeCount, revived, elapsed)
