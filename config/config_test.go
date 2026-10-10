@@ -57,7 +57,11 @@ func TestDefaultSecurityPosture(t *testing.T) {
 	if cfg.AllowPrivateOutbound {
 		t.Fatal("默认不应允许内网出站")
 	}
-	if cfg.ExitIPRateLimit > 1 {
+	if cfg.ExitIPRateLimit > 1.5 {
 		t.Fatalf("默认出口 IP 查询速率过高: %v rps", cfg.ExitIPRateLimit)
+	}
+	// 三源轮换（ip-api / ipapi.co / ipinfo），单家分摊速率必须低于 ip-api 免费档 45/分钟
+	if perSource := cfg.ExitIPRateLimit / 3 * 60; perSource >= 45 {
+		t.Fatalf("单家分摊速率 %.1f 次/分钟，超过 ip-api 免费档 45/分钟", perSource)
 	}
 }

@@ -292,9 +292,10 @@ func DefaultConfig() *Config {
 		ProxyBind: envStr("PROXY_BIND", "127.0.0.1"),
 		WebUIBind: envStr("WEBUI_BIND", "127.0.0.1"),
 
-		// 出口 IP 查询限速（ip-api 免费档 45 次/分钟 → 默认 0.6 rps）
-		ExitIPRateLimit: envFloat("EXITIP_RATE_LIMIT", 0.6),
-		ExitIPBurst:     envInt("EXITIP_BURST", 5),
+		// 出口 IP 查询限速（三源轮换 ip-api / ipapi.co / ipinfo → 默认 1.2 rps ≈ 72/分钟，
+		// 单家约 24/分钟，低于 ip-api 免费档 45/分钟）
+		ExitIPRateLimit: envFloat("EXITIP_RATE_LIMIT", 1.2),
+		ExitIPBurst:     envInt("EXITIP_BURST", 6),
 		RequireExitInfo: envBool("REQUIRE_EXIT_INFO", true),
 
 		// 安全参数

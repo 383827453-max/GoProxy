@@ -73,8 +73,8 @@ PROXY_AUTH_PASSWORD=$(gen 24)
 EXPORT_TOKEN=$(gen 32)
 
 # 出口 IP 查询限速：ip-api 免费档 45 次/分钟 → 0.6 rps（约 36/分钟）
-EXITIP_RATE_LIMIT=0.6
-EXITIP_BURST=5
+EXITIP_RATE_LIMIT=1.2
+EXITIP_BURST=6
 # 两段式验证：先按连通性+延迟快速入池，再后台补齐出口位置并做地理过滤
 REQUIRE_EXIT_INFO=false
 BLOCKED_COUNTRIES=CN

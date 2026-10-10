@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -367,8 +368,16 @@ func selfEgressIP() string {
 //	pending → disabled（命中地理过滤）
 func enrichExitInfo(validate *validator.Validator, store *storage.Storage, p storage.Proxy) {
 	ip, loc, err := validate.LookupExitInfo(p)
-	if err != nil || ip == "" {
-		store.IncrFail(p.Address)
+	if err != nil {
+		// 没拿到查询额度（限速器超时）→ 保持 pending，等下一轮，不据此判定代理无效
+		if errors.Is(err, validator.ErrNoQuota) {
+			return
+		}
+		// 真正验证失败（连不通/拿不到出口信息）→ 立即出清候选。
+		// 这些候选只会占着 MAX_PENDING 闸门额度，等到 30 分钟超时清理纯属浪费。
+		if delErr := store.Delete(p.Address); delErr == nil {
+			log.Printf("[enrich] ❌ %s 出口验证失败，移出候选", p.Address)
+		}
 		return
 	}
 	// 透明代理检测：出口 IP 与本机相同 → 流量根本没走代理

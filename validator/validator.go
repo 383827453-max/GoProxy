@@ -2,12 +2,14 @@ package validator
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -54,24 +56,39 @@ type Result struct {
 	ExitLocation string
 }
 
-// getExitIPInfo 通过代理获取出口 IP 和地理位置（多源降级 + 全局限速）。
+// ErrNoQuota 表示"没拿到出口查询额度"（限速器超时），属于可重试，不应据此判定代理无效。
+var ErrNoQuota = errors.New("出口查询额度不足（限速）")
+
+// exitSourceRotation 让多源轮换起点，避免所有请求都压在同一家免费 API 上
+// （ip-api 45/分钟、ipapi.co 1000/天、ipinfo 免费档额度各不相同，分散才跑得动）。
+var exitSourceRotation atomic.Uint32
+
+// getExitIPInfo 通过代理获取出口 IP 和地理位置（多源轮换 + 全局限速）。
 //
-// 限速原因：ip-api.com 免费档 45 次/分钟，而验证并发默认 300；不限速时会被瞬间打爆
+// 限速原因：ip-api.com 免费档 45 次/分钟，而验证并发默认 80；不限速会被瞬间打爆
 // （实测返回 503 Too many open connections），结果所有代理都因"拿不到出口信息"被拒。
-func getExitIPInfo(client *http.Client) (string, string) {
+func getExitIPInfo(client *http.Client) (string, string, error) {
 	if !netguard.WaitExitIP(3 * time.Second) {
-		return "", ""
+		return "", "", ErrNoQuota
 	}
-	if ip, loc := tryIPAPI(client); ip != "" {
-		return ip, loc
+	start := int(exitSourceRotation.Add(1)) % 3
+	for i := 0; i < 3; i++ {
+		switch (start + i) % 3 {
+		case 0:
+			if ip, loc := tryIPAPI(client); ip != "" {
+				return ip, loc, nil
+			}
+		case 1:
+			if ip, loc := tryIPAPICo(client); ip != "" {
+				return ip, loc, nil
+			}
+		case 2:
+			if ip, loc := tryIPInfo(client); ip != "" {
+				return ip, loc, nil
+			}
+		}
 	}
-	if ip, loc := tryIPAPICo(client); ip != "" {
-		return ip, loc
-	}
-	if ip, loc := tryIPInfo(client); ip != "" {
-		return ip, loc
-	}
-	return "", ""
+	return "", "", nil
 }
 
 // tryIPAPI 主源：ip-api.com（免费档仅 http，45 次/分钟）
@@ -263,7 +280,10 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	}
 
 	// 获取出口 IP 和地理位置（仅在验证通过时）
-	exitIP, exitLocation := getExitIPInfo(client)
+	exitIP, exitLocation, exitErr := getExitIPInfo(client)
+	if exitErr == nil && exitIP != "" && exitLocation == "" {
+		exitLocation = "UNKNOWN"
+	}
 
 	// 是否强制要求出口信息：默认要求；在出口查询被限流/目标站不可达时可关闭，
 	// 让代理以 UNKNOWN 地理位置入池（地理过滤随之跳过），避免池子长期为空。
@@ -340,7 +360,10 @@ func (v *Validator) LookupExitInfo(p storage.Proxy) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	ip, loc := getExitIPInfo(client)
+	ip, loc, err := getExitIPInfo(client)
+	if err != nil {
+		return "", "", err
+	}
 	if ip == "" {
 		return "", "", fmt.Errorf("未取到出口信息")
 	}
