@@ -95,7 +95,8 @@ if [ -f "$OC_DIR/proxyscraper_refresh.py" ] && systemctl list-unit-files 2>/dev/
   # 刷新器负责 master+public(+goproxy 若已打补丁)，由它写回并热重载
   sudo systemctl start opencode2api-pool-refresh.service || true
 else
-  cat "$MASTER_POOL" "$PUBLIC_POOL" "$GOPROXY_POOL" 2>/dev/null | awk 'NF' | sort -u > "$MERGED_POOL"
+  # 本地 fallback 合并：必须剔除 '#' 注释行（下游 valid_proxy 会判非法并拒绝整池）
+  cat "$MASTER_POOL" "$PUBLIC_POOL" "$GOPROXY_POOL" 2>/dev/null | grep -v '^[[:space:]]*#' | awk 'NF' | sort -u > "$MERGED_POOL"
   sudo systemctl restart opencode2api
 fi
 echo "      proxies.txt 共 $(grep -c . "$MERGED_POOL" || true) 条（其中 GoProxy 注入 $(grep -c '^socks5://' "$GOPROXY_POOL" 2>/dev/null || echo 0) 条）"

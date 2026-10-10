@@ -27,9 +27,17 @@ CONST_LINE = (
     'GOPROXY = f"{BASE}/proxies_goproxy.txt"   # 由 GoProxy 导出脚本维护（可选）\n'
 )
 MERGE_OLD = "        combined = list(dict.fromkeys(master + pub_urls))"
-MERGE_NEW = (
+# 第一版补丁写法（未过滤注释行，会被 valid_proxy() 判为非法项导致刷新中止）→ 需要就地升级
+MERGE_V1 = (
     "        # GoProxy 导出池（可选）：文件不存在时 load_lines 返回空列表，不影响原有行为\n"
     "        combined = list(dict.fromkeys(master + pub_urls + load_lines(GOPROXY)))"
+)
+MERGE_NEW = (
+    "        # GoProxy 导出池（可选）：文件不存在时 load_lines 返回空列表；\n"
+    "        # 必须过滤 '#' 注释行与空行，否则 valid_proxy() 会判定非法并中止整轮刷新\n"
+    "        goproxy_urls = [x.strip() for x in load_lines(GOPROXY)\n"
+    "                        if x.strip() and not x.strip().startswith('#')]\n"
+    "        combined = list(dict.fromkeys(master + pub_urls + goproxy_urls))"
 )
 
 
@@ -45,22 +53,29 @@ def main() -> int:
         return 2
     src = p.read_text(encoding="utf-8")
 
-    if MARK in src and MERGE_NEW in src:
-        print(f"[=] 已打过补丁：{p}")
+    if MERGE_NEW in src:
+        print(f"[=] 已是最新补丁：{p}")
         return 0
     if args.check:
-        print(f"[!] 未打补丁：{p}")
+        print(f"[!] 未打补丁或需要升级：{p}")
         return 1
-
-    if CONST_ANCHOR not in src or MERGE_OLD not in src:
-        print("[!] 锚点未命中，脚本可能已被改动，放弃（请人工确认）")
-        return 3
 
     backup = p.with_suffix(f".py.bak-goproxy-{time.strftime('%Y%m%d-%H%M%S')}")
     shutil.copy2(p, backup)
 
-    patched = src.replace(CONST_ANCHOR, CONST_ANCHOR + "\n" + CONST_LINE.rstrip("\n"), 1)
-    patched = patched.replace(MERGE_OLD, MERGE_NEW, 1)
+    patched = src
+    if MERGE_V1 in patched:
+        # 就地升级第一版补丁（只替换合并表达式，常量行保留）
+        patched = patched.replace(MERGE_V1, MERGE_NEW, 1)
+        action = "升级"
+    elif CONST_ANCHOR in patched and MERGE_OLD in patched:
+        patched = patched.replace(CONST_ANCHOR, CONST_ANCHOR + "\n" + CONST_LINE.rstrip("\n"), 1)
+        patched = patched.replace(MERGE_OLD, MERGE_NEW, 1)
+        action = "首次应用"
+    else:
+        print("[!] 锚点未命中，脚本可能已被改动，放弃（请人工确认）")
+        return 3
+
     p.write_text(patched, encoding="utf-8")
 
     try:
@@ -70,8 +85,8 @@ def main() -> int:
         print(f"[!] 语法检查失败，已回滚：{e}")
         return 4
 
-    print(f"[+] 已打补丁：{p}\n    备份：{backup}")
-    print("    合并逻辑现为：master + public + proxies_goproxy.txt → proxies.txt")
+    print(f"[+] 已{action}补丁：{p}\n    备份：{backup}")
+    print("    合并逻辑：master + public + proxies_goproxy.txt(去注释) → proxies.txt")
     return 0
 
 
