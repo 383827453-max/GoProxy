@@ -109,9 +109,22 @@ for i in $(seq 1 15); do
 done
 
 echo "[6/6] 校验"
-if ! grep -q "goproxy-pool" "$MERGED_POOL" 2>/dev/null; then
-  echo "      [!] proxies.txt 中未见 GoProxy 条目 → 刷新器可能未合并该文件"
-  echo "          请先执行：python3 deploy/patch-opencode2-refresh.py"
-fi
+# 注意：刷新器合并时会过滤 '#' 注释行，所以不能用"标记行是否存在"判断，
+# 必须按**实际条目**做集合比对。
+python3 - "$GOPROXY_POOL" "$MERGED_POOL" <<'PY'
+import pathlib, sys
+src = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+if not src.exists() or not dst.exists():
+    print(f"      [!] 缺少文件: {src} / {dst}")
+    raise SystemExit(0)
+g = {l.strip() for l in src.read_text(encoding="utf-8").splitlines()
+     if l.strip() and not l.strip().startswith("#")}
+d = {l.strip() for l in dst.read_text(encoding="utf-8").splitlines() if l.strip()}
+kept = len(g & d)
+print(f"      下游池校验: GoProxy {len(g)} 条，已合入 proxies.txt {kept} 条")
+if kept == 0 and g:
+    print("      [!] 一条都没合入 → 请先执行 python3 deploy/patch-opencode2-refresh.py")
+PY
 echo -n "      healthz: "; curl -s -m 10 http://127.0.0.1:7872/healthz || true; echo
 echo "[OK] 导入完成：本次注入 $alive_count 条（预筛通过率 $alive_count/$total）"
