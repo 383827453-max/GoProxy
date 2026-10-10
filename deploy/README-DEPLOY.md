@@ -67,28 +67,56 @@ socks5://198.51.100.7:1080
 
 ## 5. 集成到 opencode2api 代理池
 
+### 5.1 为什么不能直接写 proxies_public.txt
+
+`opencode2api` 的池由 `proxyscraper_refresh.py` 每小时维护：它自己重写
+`proxies_public.txt`，再把 `master + public` 合并写回 `proxies.txt`。
+**实测**：把 26 条代理写进 `proxies_public.txt` 后，下一轮刷新即被覆盖，注入区块消失。
+
+因此本方案用**独立文件** `proxies_goproxy.txt`（GoProxy 侧维护），并给刷新器打一次
+最小补丁，让它在合并时一并读入：
+
 ```bash
-EXPORT_TOKEN=$(sudo sed -n 's/^EXPORT_TOKEN=//p' /etc/goproxy/goproxy.env)
+python3 deploy/patch-opencode2-refresh.py        # 幂等；自动备份 + py_compile 校验 + 失败回滚
+# 合并逻辑变为：master + public + proxies_goproxy.txt(去注释) → proxies.txt
+```
+
+补丁只动两处：新增常量 `GOPROXY`、合并表达式追加该文件（并过滤 `#` 注释行）。
+**注意**：注释行必须过滤 —— 实测不过滤时刷新器的 `valid_proxy()` 会判定 2 条非法并
+`中止（不覆盖）`，导致整轮刷新失败。
+
+### 5.2 一次性执行
+
+```bash
+python3 deploy/patch-opencode2-refresh.py
 bash deploy/export-to-opencode2.sh
 ```
 
-脚本行为：
-1. 拉取 GoProxy 已通过验证的 SOCKS5 代理（延迟升序）；
-2. 以 `# >>> goproxy-pool:start ... # <<< goproxy-pool:end` 区块写入
-   `~/opencode2api/proxies_public.txt`（**幂等**，重复执行只替换本区块，不动 master 商业池）；
-3. 合并 `proxies_master.txt + proxies_public.txt → proxies.txt`；
-4. 触发 `opencode2api-pool-refresh.service`（存在时）+ `systemctl restart opencode2api`；
-5. 校验 `http://127.0.0.1:7872/healthz`。
+`export-to-opencode2.sh` 的 6 步：导出 active 代理 → **目标站可达性预筛** →
+写 `proxies_goproxy.txt`（幂等替换标记区块）→ 触发刷新器合并 → 等就绪 → 校验。
 
-建议用 timer 每 15 分钟跑一次，保持下游池跟随 GoProxy 的验证结果：
+预筛默认 `TEST_URL=https://opencode.ai/zen/v1/models`、`PARALLEL=32`：
+只把"能到达 opencode.ai"的代理注入下游池，避免用通用连通性（generate_204）污染下游。
 
-```ini
-# /etc/systemd/system/goproxy-export-opencode2.timer
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=15min
-Unit=goproxy-export-opencode2.service
+### 5.3 定时同步
+
+```bash
+bash deploy/install-export-timer.sh      # 安装 goproxy-export-opencode2.timer（默认 15 分钟）
+systemctl list-timers goproxy-export-opencode2.timer
 ```
+
+### 5.4 实测验收（Azure VM2，Ubuntu 24.04）
+
+| 项 | 结果 |
+|---|---|
+| GoProxy 池 | 60 条 active（HTTP 33 / SOCKS5 27），全部带出口 IP+地理位置 |
+| 导出 | 25 条 SOCKS5（`status=active`、`max_latency=3000`） |
+| 目标站预筛 | 25 / 25 通过（`opencode.ai/zen/v1/models` 可达） |
+| 注入后 `proxies.txt` | 2034 条（master 1865 + public 144 + goproxy 25） |
+| **跨刷新存活** | 刷新器完整跑完一轮后，25 条仍全部在 `proxies.txt` 中（总 2029） |
+| 下游 healthz | `status: ok`，proxies total 2029、healthy 2029、unhealthy 0 |
+| 端到端 | 经 `127.0.0.1:7872/v1/chat/completions` 3/3 返回 HTTP 200 |
+
 
 ## 6. 验证清单
 

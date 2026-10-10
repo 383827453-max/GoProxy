@@ -35,7 +35,30 @@
 - `deploy/`：`install-vm2.sh`（幂等部署 + 随机口令 + systemd 加固）、`goproxy.service`、
   `export-to-opencode2.sh`（幂等注入下游公开池 + 合并 + 热重载 + healthz 校验）、`README-DEPLOY.md`。
 
-## 四、尚未处理（明确留给后续）
+## 四、VM2 实部署与 opencode2api 集成（2026-10-10 实测）
+
+环境：Azure VM（`ssh wb` → vm-2），Ubuntu 24.04.4，4 vCPU / 16 GB，Go 1.26.9，CGO + gcc。
+
+| 阶段 | 结果 |
+|---|---|
+| 部署 | `install-vm2.sh` 幂等跑通：Go 工具链 → 编译（9.3 MB）→ 随机口令 env → systemd 加固单元 → 5 端口仅绑 127.0.0.1 |
+| 池填充 | 从 0 → 60 条 active（HTTP 33 / SOCKS5 27），全部带出口 IP + 地理位置；日志无 `unknown protocol https` 刷屏 |
+| 地理过滤 | 出口国家分布 US/RU/IN/DE/VN/BD…，CN 条目 0（`BLOCKED_COUNTRIES=CN` 生效） |
+| 出口限速 | 12 分钟内完成两段式验证，无 `503 Too many open connections`（改造前本机实测必现） |
+| 导出接口 | `/api/export` 401（无 token）/ 60 条（有 token）；`status=active` 过滤生效 |
+| 下游集成 | 25 条注入 `proxies_goproxy.txt` → 合并进 `proxies.txt`（2034 条） |
+| 端到端 | 经 opencode2api `:7872` 真实推理请求 3/3 HTTP 200；healthz `ok`、2032/2032 healthy |
+
+集成中踩到并修掉的两个坑（已写入部署文档与补丁脚本）：
+
+1. **注入被下一轮刷新覆盖**：`proxies_public.txt` 由 opencode2api 自己的
+   `proxyscraper_refresh.py` 每轮重写 → 改为独立文件 `proxies_goproxy.txt` +
+   给刷新器打一次性最小补丁（`deploy/patch-opencode2-refresh.py`，幂等、带备份与语法校验）。
+2. **注释行导致下游整轮刷新中止**：补丁第一版把 `# >>> goproxy-pool:start` 标记行一起并入，
+   刷新器 `valid_proxy()` 判为非法项并 `中止（不覆盖）` → 合并前过滤 `#` 与空行；
+   同时清理了 `proxies_public.txt` 里历史残留的注入区块。
+
+## 五、尚未处理（明确留给后续）
 
 - sing-box 仍固定 1.13.5：1.14.x 调整了部分 outbound/route 字段语义，升级前必须用 `sing-box check` 回归生成配置。
 - `checker/optimizer` 未做单元测试；`webui/dashboard.go` 为内联 HTML，未做前端收敛。
