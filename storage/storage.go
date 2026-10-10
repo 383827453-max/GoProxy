@@ -1328,6 +1328,27 @@ func (s *Storage) GetDisabledFreeProxies(limit int) ([]Proxy, error) {
 	return proxies, nil
 }
 
+// CountByStatus 返回各状态的代理数量（可观测性：pending 候选是否积压、degraded 有多少、
+// 有多少被熔断等待复活）。三态健康策略落地后，这些数字是判断池子健康的关键指标。
+func (s *Storage) CountByStatus() (map[string]int, error) {
+	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM proxies GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int)
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return nil, err
+		}
+		out[status] = n
+	}
+	return out, rows.Err()
+}
+
 // SetStatus 更新代理状态（active / degraded / disabled / pending）。
 //
 // pending 表示"连通性已通过、但出口信息尚未验证"的候选代理：

@@ -639,7 +639,22 @@ func (s *Server) apiPoolStatus(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonOK(w, status)
+	// 保持原有平铺结构（Total/HTTP/SOCKS5/State...）不变，只**追加** ByStatus，
+	// 避免破坏既有调用方；ByStatus 用于观测三态：pending 候选积压 / degraded 降级 / disabled 待复活。
+	raw, err := json.Marshal(status)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	payload := make(map[string]interface{}, 16)
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if counts, err := s.storage.CountByStatus(); err == nil {
+		payload["ByStatus"] = counts
+	}
+	jsonOK(w, payload)
 }
 
 // apiQualityDistribution 获取质量分布

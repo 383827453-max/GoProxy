@@ -3,6 +3,7 @@ package fetcher
 import (
 	"database/sql"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 )
@@ -83,13 +84,16 @@ func (sm *SourceManager) RecordFail(url string, failThreshold, disableThreshold,
 	sm.db.QueryRow(`SELECT consecutive_fails FROM source_status WHERE url = ?`, url).Scan(&consecutiveFails)
 
 	if consecutiveFails >= disableThreshold {
-		// 禁用源
-		disabledUntil := time.Now().Add(time.Duration(cooldownMinutes) * time.Minute)
+		// 禁用源。冷却时间加随机抖动（吸收 nfx/slrp 的 sources/try.go:117-121 随机退避）：
+		// 固定冷却会让一批同时挂掉的源在同一时刻集体重试，等于周期性自我 DDoS。
+		jitter := time.Duration(rand.Int63n(int64(time.Duration(cooldownMinutes) * time.Minute / 2)))
+		disabledUntil := time.Now().Add(time.Duration(cooldownMinutes)*time.Minute + jitter)
 		sm.db.Exec(
 			`UPDATE source_status SET status = 'disabled', disabled_until = ? WHERE url = ?`,
 			disabledUntil, url,
 		)
-		log.Printf("[source] ⛔ 禁用源（连续失败%d次）: %s (冷却%d分钟)", consecutiveFails, url, cooldownMinutes)
+		log.Printf("[source] ⛔ 禁用源（连续失败%d次）: %s (冷却%d分钟+抖动%v)",
+			consecutiveFails, url, cooldownMinutes, jitter.Round(time.Second))
 	} else if consecutiveFails >= failThreshold {
 		// 降级源
 		sm.db.Exec(`UPDATE source_status SET status = 'degraded' WHERE url = ?`, url)
