@@ -93,6 +93,14 @@ type Config struct {
 	AllowPrivateOutbound bool   // 订阅/贡献导入是否允许内网地址（默认 false）
 	ExportToken          string // /api/export 静态令牌（留空则仅管理员会话可用）
 
+	// ========== 三态健康策略与复活 ==========
+	FailureThreshold int // 连续失败达到该次数才移除（默认 5；之前硬编码为 3）
+	ReanimateBatch   int // 每轮健康检查最多探测多少个已禁用代理（默认 10）
+
+	// ========== 出口去重 / 同 C 段限制 ==========
+	ExitSubnetCooldownSeconds int // 同一出口 /24 的冷却时间（秒，默认 60；0=关闭该特性）
+	ExitSubnetHistorySize     int // 冷却窗口内最多记住多少个 /24（默认 16）
+
 	// 地理过滤配置
 	BlockedCountries []string // 屏蔽的国家代码列表（如 ["CN", "RU"]，默认 ["CN"]）
 	AllowedCountries []string // 允许的国家代码列表（白名单，非空时优先于黑名单）
@@ -294,6 +302,14 @@ func DefaultConfig() *Config {
 		LoginWindowMinutes:   envInt("LOGIN_WINDOW_MINUTES", 10),
 		AllowPrivateOutbound: envBool("ALLOW_PRIVATE_OUTBOUND", false),
 		ExportToken:          envStr("EXPORT_TOKEN", ""),
+
+		// 三态健康策略与复活
+		FailureThreshold: envInt("FAILURE_THRESHOLD", 5),
+		ReanimateBatch:   envInt("REANIMATE_BATCH", 10),
+
+		// 出口去重 / 同 C 段限制
+		ExitSubnetCooldownSeconds: envInt("EXIT_SUBNET_COOLDOWN_SECONDS", 60),
+		ExitSubnetHistorySize:     envInt("EXIT_SUBNET_HISTORY_SIZE", 16),
 
 		// 地理过滤配置
 		BlockedCountries: blockedCountries,

@@ -310,12 +310,23 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	return true, latency, exitIP, exitLocation
 }
 
+// inflight 记录正在查询出口信息的代理，避免同一地址被并发重复探测
+// （吸收 daimon3332/easy-proxies 的 probe_scheduler 去重思路：
+// 定时复检 + 手动复检 + 入池补齐三路并发打同一个地址，是外部 API 限流的主因之一）。
+var inflight sync.Map
+
 // LookupExitInfo 只为"已入池/候选入池"的代理查询出口信息（受全局限速保护）。
 //
 // 两段式验证的第二步：第一段（ValidateOne）只做连通性 + 延迟 + CONNECT 隧道，
 // 高并发跑完全部候选；第二段只对少量幸存者查出口 IP/位置，
 // 避免把 45 次/分钟的免费额度浪费在几万个死代理上。
 func (v *Validator) LookupExitInfo(p storage.Proxy) (string, string, error) {
+	// 单飞：同一地址已有查询在跑时直接返回，不再消耗限速额度
+	if _, loaded := inflight.LoadOrStore(p.Address, struct{}{}); loaded {
+		return "", "", fmt.Errorf("出口查询已在进行中: %s", p.Address)
+	}
+	defer inflight.Delete(p.Address)
+
 	var client *http.Client
 	var err error
 	switch p.Protocol {

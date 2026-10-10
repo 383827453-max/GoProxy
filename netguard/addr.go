@@ -174,3 +174,22 @@ func FormatProxyURI(protocol, address string) string {
 	}
 	return fmt.Sprintf("%s://%s", p, address)
 }
+
+// Subnet24 返回 IPv4 的 /24 网段前缀（形如 "1.2.3."），用于"同 C 段限制"。
+// 非 IPv4 或解析失败返回空串（调用方应忽略该样本）。
+func Subnet24(ip string) string {
+	v4 := net.ParseIP(strings.TrimSpace(ip)).To4()
+	if v4 == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d.%d.%d.", v4[0], v4[1], v4[2])
+}
+
+// Subnet24Filter 把网段前缀转成 SQL LIKE 模式（"1.2.3." → "1.2.3.%"）。
+func Subnet24Filter(prefix string) string {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return ""
+	}
+	return strings.TrimSuffix(p, "%") + "%"
+}

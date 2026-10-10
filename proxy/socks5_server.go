@@ -19,6 +19,7 @@ type SOCKS5Server struct {
 	cfg     *config.Config
 	mode    string // "random" 或 "lowest-latency"
 	port    string
+	subnets *subnetTracker
 }
 
 // NewSOCKS5 创建 SOCKS5 服务器
@@ -28,6 +29,9 @@ func NewSOCKS5(s *storage.Storage, cfg *config.Config, mode string, port string)
 		cfg:     cfg,
 		mode:    mode,
 		port:    port,
+		subnets: newSubnetTracker(
+			time.Duration(cfg.ExitSubnetCooldownSeconds)*time.Second,
+			cfg.ExitSubnetHistorySize),
 	}
 }
 
@@ -126,34 +130,51 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 func (s *SOCKS5Server) selectSOCKS5Proxy(tried []string) (*storage.Proxy, error) {
 	cfg := config.Get()
 	sourceFilter := sourceFilterFromMode(cfg.CustomProxyMode)
+	subnets := s.subnets.Active()
 
-	// 混用 + 优先模式
+	pick := func(preferSource string) (*storage.Proxy, error) {
+		if s.mode == "lowest-latency" {
+			return s.storage.GetLowestLatencyByProtocolExcludeSubnets("socks5", tried, subnets, preferSource)
+		}
+		return s.storage.GetRandomByProtocolExcludeSubnets("socks5", tried, subnets, preferSource)
+	}
+
+	var p *storage.Proxy
+	var err error
 	if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
 		preferSource := "custom"
 		if cfg.CustomFreePriority {
 			preferSource = "free"
 		}
-		var p *storage.Proxy
-		var err error
-		if s.mode == "lowest-latency" {
-			p, err = s.storage.GetLowestLatencyByProtocolExcludeFiltered("socks5", tried, preferSource)
-		} else {
-			p, err = s.storage.GetRandomByProtocolExcludeFiltered("socks5", tried, preferSource)
+		p, err = pick(preferSource)
+		if err != nil {
+			p, err = pick("")
 		}
-		if err == nil {
-			return p, nil
-		}
-		// fallback
-		if s.mode == "lowest-latency" {
-			return s.storage.GetLowestLatencyByProtocolExcludeFiltered("socks5", tried, "")
-		}
-		return s.storage.GetRandomByProtocolExcludeFiltered("socks5", tried, "")
+	} else {
+		p, err = pick(sourceFilter)
 	}
 
-	if s.mode == "lowest-latency" {
-		return s.storage.GetLowestLatencyByProtocolExcludeFiltered("socks5", tried, sourceFilter)
+	// 冷却网段把池子排除空时回退（可用性优先）
+	if err != nil && len(subnets) > 0 {
+		subnets = nil
+		if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
+			preferSource := "custom"
+			if cfg.CustomFreePriority {
+				preferSource = "free"
+			}
+			p, err = pick(preferSource)
+			if err != nil {
+				p, err = pick("")
+			}
+		} else {
+			p, err = pick(sourceFilter)
+		}
 	}
-	return s.storage.GetRandomByProtocolExcludeFiltered("socks5", tried, sourceFilter)
+
+	if err == nil && p != nil {
+		s.subnets.Record(p.ExitIP)
+	}
+	return p, err
 }
 
 // socks5Handshake 处理 SOCKS5 握手

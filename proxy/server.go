@@ -23,6 +23,7 @@ type Server struct {
 	cfg     *config.Config
 	mode    string // "random" 或 "lowest-latency"
 	port    string
+	subnets *subnetTracker
 }
 
 func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Server {
@@ -31,6 +32,9 @@ func New(s *storage.Storage, cfg *config.Config, mode string, port string) *Serv
 		cfg:     cfg,
 		mode:    mode,
 		port:    port,
+		subnets: newSubnetTracker(
+			time.Duration(cfg.ExitSubnetCooldownSeconds)*time.Second,
+			cfg.ExitSubnetHistorySize),
 	}
 }
 
@@ -103,34 +107,51 @@ func (s *Server) checkAuth(r *http.Request) bool {
 func (s *Server) selectProxy(tried []string, lowestLatency bool) (*storage.Proxy, error) {
 	cfg := config.Get()
 	sourceFilter := sourceFilterFromMode(cfg.CustomProxyMode)
+	subnets := s.subnets.Active()
 
-	// 混用 + 优先模式：先尝试优先源，无可用则 fallback 全部
+	pick := func(preferSource string) (*storage.Proxy, error) {
+		if lowestLatency {
+			return s.storage.GetLowestLatencyExcludeSubnets(tried, subnets, preferSource)
+		}
+		return s.storage.GetRandomExcludeSubnets(tried, subnets, preferSource)
+	}
+
+	var p *storage.Proxy
+	var err error
 	if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
 		preferSource := "custom"
 		if cfg.CustomFreePriority {
 			preferSource = "free"
 		}
-		var p *storage.Proxy
-		var err error
-		if lowestLatency {
-			p, err = s.storage.GetLowestLatencyExcludeFiltered(tried, preferSource)
-		} else {
-			p, err = s.storage.GetRandomExcludeFiltered(tried, preferSource)
+		p, err = pick(preferSource)
+		if err != nil {
+			p, err = pick("")
 		}
-		if err == nil {
-			return p, nil
-		}
-		// fallback 到全部
-		if lowestLatency {
-			return s.storage.GetLowestLatencyExcludeFiltered(tried, "")
-		}
-		return s.storage.GetRandomExcludeFiltered(tried, "")
+	} else {
+		p, err = pick(sourceFilter)
 	}
 
-	if lowestLatency {
-		return s.storage.GetLowestLatencyExcludeFiltered(tried, sourceFilter)
+	// 冷却网段把池子排除空时，回退到"不做 /24 限制"，可用性优先
+	if err != nil && len(subnets) > 0 {
+		subnets = nil
+		if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
+			preferSource := "custom"
+			if cfg.CustomFreePriority {
+				preferSource = "free"
+			}
+			p, err = pick(preferSource)
+			if err != nil {
+				p, err = pick("")
+			}
+		} else {
+			p, err = pick(sourceFilter)
+		}
 	}
-	return s.storage.GetRandomExcludeFiltered(tried, sourceFilter)
+
+	if err == nil && p != nil {
+		s.subnets.Record(p.ExitIP)
+	}
+	return p, err
 }
 
 // removeOrDisableProxy 根据代理来源决定删除或禁用

@@ -1185,6 +1185,149 @@ func scanSubscription(rows *sql.Rows) (*Subscription, error) {
 }
 
 // Close 关闭数据库
+// buildSubnetFilter 生成"排除同 C 段出口"的 SQL 片段（exit_ip NOT LIKE 'a.b.c.%'）。
+// 单独抽出便于单测：入参是 /24 前缀（如 "1.2.3."），空/非法项被忽略。
+func buildSubnetFilter(subnets []string) (string, []any) {
+	var sb strings.Builder
+	var args []any
+	for _, s := range subnets {
+		p := strings.TrimSpace(s)
+		if p == "" {
+			continue
+		}
+		pattern := strings.TrimSuffix(p, "%") + "%"
+		sb.WriteString(" AND (exit_ip IS NULL OR exit_ip = '' OR exit_ip NOT LIKE ?)")
+		args = append(args, pattern)
+	}
+	return sb.String(), args
+}
+
+// selectByProtocol 是各选择方法的公共实现：协议 + 来源 + 排除地址 + 排除同 C 段。
+func (s *Storage) selectByProtocol(protocol string, excludes []string, subnets []string, sourceFilter string, lowestLatency bool) (*Proxy, error) {
+	query := "SELECT " + proxyColumns + ` FROM proxies WHERE protocol = ? AND status IN ('active', 'degraded') AND fail_count < 3`
+	args := []any{protocol}
+
+	if sourceFilter != "" {
+		query += " AND source = ?"
+		args = append(args, sourceFilter)
+	}
+	if len(excludes) > 0 {
+		query += " AND address NOT IN (" + placeholders(len(excludes)) + ")"
+		for _, e := range excludes {
+			args = append(args, e)
+		}
+	}
+	subnetSQL, subnetArgs := buildSubnetFilter(subnets)
+	query += subnetSQL
+	args = append(args, subnetArgs...)
+
+	if lowestLatency {
+		query += " ORDER BY latency ASC"
+	} else {
+		query += " ORDER BY RANDOM()"
+	}
+	query += " LIMIT 1"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
+	}
+	return scanProxy(rows)
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// GetRandomByProtocolExcludeSubnets 随机取一个代理，排除指定地址与指定出口 /24 网段。
+// 用于"出口 IP 去重 + 同 C 段限制"：避免连续请求都从同一机房 / 同一 C 段出去。
+func (s *Storage) GetRandomByProtocolExcludeSubnets(protocol string, excludes, subnets []string, sourceFilter string) (*Proxy, error) {
+	return s.selectByProtocol(protocol, excludes, subnets, sourceFilter, false)
+}
+
+// selectAny 不限定协议的选择（HTTP 代理服务用，池内 http/socks5 均可转发 HTTP 请求）。
+func (s *Storage) selectAny(excludes []string, subnets []string, sourceFilter string, lowestLatency bool) (*Proxy, error) {
+	query := "SELECT " + proxyColumns + ` FROM proxies WHERE status IN ('active', 'degraded') AND fail_count < 3`
+	var args []any
+	if sourceFilter != "" {
+		query += " AND source = ?"
+		args = append(args, sourceFilter)
+	}
+	if len(excludes) > 0 {
+		query += " AND address NOT IN (" + placeholders(len(excludes)) + ")"
+		for _, e := range excludes {
+			args = append(args, e)
+		}
+	}
+	subnetSQL, subnetArgs := buildSubnetFilter(subnets)
+	query += subnetSQL
+	args = append(args, subnetArgs...)
+	if lowestLatency {
+		query += " ORDER BY latency ASC"
+	} else {
+		query += " ORDER BY RANDOM()"
+	}
+	query += " LIMIT 1"
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, sql.ErrNoRows
+	}
+	return scanProxy(rows)
+}
+
+// GetRandomExcludeSubnets 随机取一个（不限协议），排除地址与出口 /24 网段。
+func (s *Storage) GetRandomExcludeSubnets(excludes, subnets []string, sourceFilter string) (*Proxy, error) {
+	return s.selectAny(excludes, subnets, sourceFilter, false)
+}
+
+// GetLowestLatencyExcludeSubnets 最低延迟取一个（不限协议），排除地址与出口 /24 网段。
+func (s *Storage) GetLowestLatencyExcludeSubnets(excludes, subnets []string, sourceFilter string) (*Proxy, error) {
+	return s.selectAny(excludes, subnets, sourceFilter, true)
+}
+
+// GetLowestLatencyByProtocolExcludeSubnets 最低延迟取一个，同样排除地址与出口 /24 网段。
+func (s *Storage) GetLowestLatencyByProtocolExcludeSubnets(protocol string, excludes, subnets []string, sourceFilter string) (*Proxy, error) {
+	return s.selectByProtocol(protocol, excludes, subnets, sourceFilter, true)
+}
+
+// GetDisabledFreeProxies 取出被禁用的免费代理（用于半开探测/复活）。
+// 订阅代理走 GetDisabledCustomProxies（有独立的探测唤醒逻辑）。
+func (s *Storage) GetDisabledFreeProxies(limit int) ([]Proxy, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.Query(
+		`SELECT `+proxyColumns+` FROM proxies
+		 WHERE status = 'disabled' AND source = 'free'
+		 ORDER BY last_check ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows)
+		if err != nil {
+			return nil, err
+		}
+		proxies = append(proxies, *p)
+	}
+	return proxies, nil
+}
+
 // SetStatus 更新代理状态（active / degraded / disabled / pending）。
 //
 // pending 表示"连通性已通过、但出口信息尚未验证"的候选代理：
