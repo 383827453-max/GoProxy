@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# 把 GoProxy 池中已通过验证的代理导入 opencode2api 的"公开补充池"，并触发合并/热重载。
+# 把 GoProxy 池中已通过验证的代理导入 opencode2api 的代理池，并触发合并/热重载。
 #
-# 关键设计：写入下游池之前，先用**下游真实目标站**做一次可达性预筛
-# （默认 https://opencode.ai/zen/v1/models）。理由：GoProxy 的验证目标是
-# generate_204（通用连通性），而 opencode2api 的池只服务于 opencode.ai；
-# 不预筛就会把"能上网但到不了 opencode.ai"的代理灌进下游池，反而降低可用性。
+# 两个关键设计：
+# 1) 写入下游池之前，先用**下游真实目标站**做可达性预筛（默认
+#    https://opencode.ai/zen/v1/models）。GoProxy 的验证目标是 generate_204（通用连通性），
+#    而 opencode2api 的池只服务于 opencode.ai；不预筛会把"能上网但到不了 opencode.ai"
+#    的代理灌进下游池，反而降低可用性。
+# 2) 写入**独立文件** proxies_goproxy.txt，而不是 proxies_public.txt。
+#    因为 opencode2api 的 proxyscraper_refresh.py 每轮会重写 public 池，
+#    直接写 public 会被下一轮刷新覆盖（实测注入 26 条后区块消失）。
+#    独立文件需要刷新器一并合并，用 deploy/patch-opencode2-refresh.py 打一次补丁即可。
 #
 # 用法：
 #   EXPORT_TOKEN=xxx bash deploy/export-to-opencode2.sh
 #   TEST_URL=https://opencode.ai/zen/v1/models PARALLEL=32 LIMIT=300 ...
-#
-# 幂等：每次运行替换上一次注入的区块（# >>> goproxy-pool:start ... end），
-# 不污染 opencode2api 原有的 master（商业认证）池。
 set -euo pipefail
 
 GOPROXY_BASE="${GOPROXY_BASE:-http://127.0.0.1:7778}"
 OC_DIR="${OC_DIR:-$HOME/opencode2api}"
+GOPROXY_POOL="${GOPROXY_POOL:-$OC_DIR/proxies_goproxy.txt}"
 PUBLIC_POOL="${PUBLIC_POOL:-$OC_DIR/proxies_public.txt}"
 MERGED_POOL="${MERGED_POOL:-$OC_DIR/proxies.txt}"
 MASTER_POOL="${MASTER_POOL:-$OC_DIR/proxies_master.txt}"
@@ -73,8 +76,8 @@ if [ "${alive_count:-0}" -lt "$MIN_ALIVE" ]; then
   exit 3
 fi
 
-echo "[3/6] 写入公开补充池 $PUBLIC_POOL（替换上一次注入区块）"
-python3 - "$PUBLIC_POOL" "$alive" <<'PY'
+echo "[3/6] 写入 GoProxy 专用池 $GOPROXY_POOL（替换上一次注入区块）"
+python3 - "$GOPROXY_POOL" "$alive" <<'PY'
 import pathlib, re, sys
 pool_path, alive_path = sys.argv[1], sys.argv[2]
 p = pathlib.Path(pool_path)
@@ -87,25 +90,27 @@ kept = len([l for l in p.read_text().splitlines() if l and not l.startswith("#")
 print(f"      [+] {p} 现有 {kept} 条")
 PY
 
-echo "[4/6] 合并 master + public → proxies.txt"
-if [ -f "$MASTER_POOL" ]; then
-  cat "$MASTER_POOL" "$PUBLIC_POOL" | awk 'NF' | sort -u > "$MERGED_POOL"
-else
-  cp "$PUBLIC_POOL" "$MERGED_POOL"
-fi
-echo "      proxies.txt 共 $(grep -c . "$MERGED_POOL" || true) 条"
-
-echo "[5/6] 触发热重载"
+echo "[4/6] 合并 master + public + goproxy → proxies.txt"
 if [ -f "$OC_DIR/proxyscraper_refresh.py" ] && systemctl list-unit-files 2>/dev/null | grep -q '^opencode2api-pool-refresh.service'; then
+  # 刷新器负责 master+public(+goproxy 若已打补丁)，由它写回并热重载
   sudo systemctl start opencode2api-pool-refresh.service || true
+else
+  cat "$MASTER_POOL" "$PUBLIC_POOL" "$GOPROXY_POOL" 2>/dev/null | awk 'NF' | sort -u > "$MERGED_POOL"
+  sudo systemctl restart opencode2api
 fi
-sudo systemctl restart opencode2api
+echo "      proxies.txt 共 $(grep -c . "$MERGED_POOL" || true) 条（其中 GoProxy 注入 $(grep -c '^socks5://' "$GOPROXY_POOL" 2>/dev/null || echo 0) 条）"
 
-echo "[6/6] 校验 opencode2api"
+echo "[5/6] 等待服务就绪"
 for i in $(seq 1 15); do
   sleep 3
   if curl -sf -m 10 http://127.0.0.1:7872/healthz >/dev/null 2>&1; then break; fi
   echo "      等待 opencode2api [$i/15]"
 done
-echo -n "      healthz: "; curl -s -m 10 http://127.0.0.1:7872/healthz; echo
+
+echo "[6/6] 校验"
+if ! grep -q "goproxy-pool" "$MERGED_POOL" 2>/dev/null; then
+  echo "      [!] proxies.txt 中未见 GoProxy 条目 → 刷新器可能未合并该文件"
+  echo "          请先执行：python3 deploy/patch-opencode2-refresh.py"
+fi
+echo -n "      healthz: "; curl -s -m 10 http://127.0.0.1:7872/healthz || true; echo
 echo "[OK] 导入完成：本次注入 $alive_count 条（预筛通过率 $alive_count/$total）"
