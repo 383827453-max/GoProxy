@@ -58,7 +58,30 @@
    刷新器 `valid_proxy()` 判为非法项并 `中止（不覆盖）` → 合并前过滤 `#` 与空行；
    同时清理了 `proxies_public.txt` 里历史残留的注入区块。
 
-## 五、尚未处理（明确留给后续）
+## 五、第二轮改进（三态健康 / 熔断复活 / 出口去重 / 入池节流）
+
+按 `docs/peer-proxy-pool-research.md` 的优先级清单落地，全部带单元测试：
+
+| 项 | 来源 | 实现 |
+|---|---|---|
+| P0-1 三态健康策略 | tongsq/proxy-collect | `checker.failureOutcome()` 纯函数：失败先置 `degraded` 保留，达到 `FAILURE_THRESHOLD`（默认 5，原硬编码 3）才移除；免费删除、订阅禁用 |
+| P0-5 熔断复活（半开） | nfx/slrp + easy-proxies | `health_checker.reanimateDisabled()`：每轮取 `REANIMATE_BATCH` 个 `disabled` 免费代理重探，健康则 `EnableProxy + ResetFail + active`；探测成功即清失败计数 |
+| P0-6 出口去重 / 同 C 段限制 | yunginnanet/prox5 拨号中间件 | 新增 `proxy/subnetTracker`（默认 60s 冷却、16 个 /24），HTTP 与 SOCKS5 两条选择路径均排除冷却网段，全池同网段时自动回退 |
+| P0-4 探针去重（部分） | easy-proxies probe_scheduler | `validator.LookupExitInfo` 单飞：同地址并发只消耗一次外部 API 额度 |
+| 入池节流（本轮实测驱动） | — | 实测 pending 以远快于出口验证的速度增长 → 新增 `MAX_PENDING`（默认 50）闸门 + 健康检查每轮 `DeleteStalePending(30)` |
+| P1-9 源退避抖动 | slrp sources/try.go | 源禁用冷却加 0~50% 随机抖动，避免同时挂掉的源集体重试 |
+| 可观测性 | — | `/api/pool/status` 追加 `ByStatus`（active/degraded/disabled/pending），填充日志新增"待验证积压"拒绝计数 |
+
+VM2 实测（同一台机器，连续两轮健康检查）：
+
+```
+[health] 完成: 验证20 有效11 更新11 降级9 移除0 复活0   ← 旧实现会直接删掉这 9 个
+[health] 🧹 清理超时候选(pending): 26 个
+/api/pool/status → ByStatus {"active":85,"degraded":10,"pending":33}
+出口多样性：连续 8 次经 :7779 请求，成功的 4 次出口 IP 落在 4 个不同 /24（同 C 段不重复）
+```
+
+## 六、尚未处理（明确留给后续）
 
 - sing-box 仍固定 1.13.5：1.14.x 调整了部分 outbound/route 字段语义，升级前必须用 `sing-box check` 回归生成配置。
 - `checker/optimizer` 未做单元测试；`webui/dashboard.go` 为内联 HTML，未做前端收敛。

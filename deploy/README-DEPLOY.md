@@ -46,6 +46,11 @@ REPO=https://github.com/<you>/GoProxy.git BRANCH=main bash deploy/install-vm2.sh
 | `BLOCKED_COUNTRIES` / `ALLOWED_COUNTRIES` | `CN` / 空 | 出口地理黑/白名单（白名单非空时优先） |
 | `ALLOW_PRIVATE_OUTBOUND` | `false` | 订阅/贡献导入是否允许内网地址（SSRF 开关） |
 | `SESSION_TTL_MINUTES` / `LOGIN_MAX_ATTEMPTS` | `720` / `10` | WebUI 会话有效期 / 同 IP 登录失败上限 |
+| `FAILURE_THRESHOLD` | `5` | 三态健康策略：连续失败达到该值才移除（之前硬编码 3） |
+| `REANIMATE_BATCH` | `10` | 每轮健康检查最多半开探测多少个已禁用代理（复活通道） |
+| `MAX_PENDING` | `50` | pending（出口待验证）候选上限，积压超限即暂停入池 |
+| `EXIT_SUBNET_COOLDOWN_SECONDS` | `60` | 同一出口 /24 的冷却秒数（出口去重；`0`=关闭） |
+| `EXIT_SUBNET_HISTORY_SIZE` | `16` | 冷却窗口内最多记住多少个 /24 |
 
 ## 4. 代理导出接口
 

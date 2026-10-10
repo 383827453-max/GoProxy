@@ -80,6 +80,15 @@ REQUIRE_EXIT_INFO=false
 BLOCKED_COUNTRIES=CN
 ALLOWED_COUNTRIES=
 
+# 三态健康策略 / 复活 / 入池节流
+FAILURE_THRESHOLD=5          # 连续失败达到该次数才移除（先降级保留）
+REANIMATE_BATCH=10           # 每轮健康检查半开探测的已禁用代理数
+MAX_PENDING=50               # 出口待验证候选上限，超限暂停入池
+
+# 出口去重（同 C 段限制）
+EXIT_SUBNET_COOLDOWN_SECONDS=60
+EXIT_SUBNET_HISTORY_SIZE=16
+
 # 订阅/贡献导入是否允许内网地址（SSRF 开关，默认 false）
 ALLOW_PRIVATE_OUTBOUND=false
 CUSTOM_PROXY_MODE=mixed
