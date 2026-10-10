@@ -12,6 +12,7 @@ import (
 	"goproxy/custom"
 	"goproxy/fetcher"
 	"goproxy/logger"
+	"goproxy/netguard"
 	"goproxy/optimizer"
 	"goproxy/pool"
 	"goproxy/proxy"
@@ -47,7 +48,8 @@ func main() {
 	}
 	defer store.Close()
 
-	// 初始化限流器
+	// 初始化限流器（出口 IP 查询：ip-api 免费档 45 次/分钟，必须全局限速）
+	netguard.InitExitIPLimiter(cfg.ExitIPRateLimit, cfg.ExitIPBurst)
 	fetcher.InitIPQueryLimiter(cfg.IPQueryRateLimit)
 
 	// 初始化核心模块
@@ -57,7 +59,7 @@ func main() {
 	poolMgr := pool.NewManager(store, cfg)
 	healthChecker := checker.NewHealthChecker(store, validate, cfg, poolMgr)
 	opt := optimizer.NewOptimizer(store, fetch, validate, poolMgr, cfg)
-	
+
 	// 清理无效代理（免费代理删除，订阅代理禁用）
 	totalDeleted := 0
 	if len(cfg.AllowedCountries) > 0 {
@@ -81,11 +83,11 @@ func main() {
 		log.Printf("[main] 🧹 已清理 %d 个无出口信息的代理", deleted)
 		totalDeleted += int(deleted)
 	}
-	
+
 	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟
 	randomServer := proxy.New(store, cfg, "random", cfg.ProxyPort)
 	stableServer := proxy.New(store, cfg, "lowest-latency", cfg.StableProxyPort)
-	
+
 	// 创建 SOCKS5 代理服务器：随机轮换 + 最低延迟
 	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port)
 	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port)
@@ -223,7 +225,9 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		cfg := config.Get()
 		maxLatency := cfg.GetLatencyThreshold(status.State)
 
-		if result.ExitIP == "" || result.ExitLocation == "" {
+		// 出口信息为"可选"时（REQUIRE_EXIT_INFO=false），先按连通性入池，
+		// 再由 enrichExitInfo 在后台用限速额度补齐位置并做地理过滤。
+		if cfg.RequireExitInfo && (result.ExitIP == "" || result.ExitLocation == "") {
 			rejectedNoExit.Add(1)
 			return
 		}
@@ -243,6 +247,9 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 
 		if added, reason := poolMgr.TryAddProxy(proxyToAdd); added {
 			addedCount.Add(1)
+			if proxyToAdd.ExitIP == "" {
+				go enrichExitInfo(validate, store, proxyToAdd)
+			}
 		} else if reason == "slots_full" {
 			rejectedFull.Add(1)
 		} else if len(result.ExitLocation) >= 2 {
@@ -308,6 +315,30 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		len(candidates), validCount.Load(), addedCount.Load(),
 		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(), rejectedFull.Load(),
 		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
+}
+
+// enrichExitInfo 后台补齐出口信息（两段式验证的第二段）。
+//
+// 第一段只做连通性 + 延迟，高并发跑完上万候选；第二段只对真正入池的少数代理
+// 查询出口 IP/位置，且全程受 netguard 全局限速（默认 0.6 rps ≈ 36 次/分钟，
+// 低于 ip-api 免费档 45 次/分钟），避免把免费额度浪费在死代理上。
+// 命中地理过滤的代理直接禁用（保留探测唤醒机会，不硬删）。
+func enrichExitInfo(validate *validator.Validator, store *storage.Storage, p storage.Proxy) {
+	ip, loc, err := validate.LookupExitInfo(p)
+	if err != nil || ip == "" {
+		return
+	}
+	if err := store.UpdateExitInfo(p.Address, ip, loc, p.Latency); err != nil {
+		log.Printf("[enrich] 写入出口信息失败 %s: %v", p.Address, err)
+		return
+	}
+	if validate.IsGeoBlocked(loc) {
+		if err := store.DisableProxy(p.Address); err == nil {
+			log.Printf("[enrich] 🚫 %s 出口 %s 命中地理过滤，已禁用", p.Address, loc)
+		}
+		return
+	}
+	log.Printf("[enrich] ✅ %s 出口 %s (%s)", p.Address, ip, loc)
 }
 
 // startStatusMonitor 状态监控协程

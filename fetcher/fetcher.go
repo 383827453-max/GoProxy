@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"goproxy/netguard"
 	"goproxy/storage"
 )
 
@@ -264,27 +265,24 @@ func (f *Fetcher) fetchFromURL(url, protocol string) ([]storage.Proxy, error) {
 	return parseProxyList(resp.Body, protocol)
 }
 
+// parseProxyList 解析公开源返回的代理列表。
+//
+// 归一化规则（旧实现只做 socks4→socks5，导致 "https://x.x.x.x:port" 被当成协议 https
+// 入库、日志刷屏并浪费验证预算）：
+//   - 带 scheme 的行：http/https → http，socks4/socks4a/socks5/socks5h → socks5，其余整行丢弃；
+//   - 不带 scheme 的行：用源声明的默认协议；
+//   - 仅接受字面量 IP:port，端口 1-65535；
+//   - 环回 / 私网 / 链路本地 / CGNAT / 云元数据地址丢弃。
 func parseProxyList(r io.Reader, protocol string) ([]storage.Proxy, error) {
 	var proxies []storage.Proxy
+	total, dropped := 0, 0
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		addr := line
-		proto := protocol
-		// 支持 protocol://host:port 格式
-		if idx := strings.Index(line, "://"); idx != -1 {
-			proto = line[:idx]
-			addr = line[idx+3:]
-			// socks4 当 socks5 处理
-			if proto == "socks4" {
-				proto = "socks5"
-			}
-		}
-		parts := strings.Split(addr, ":")
-		if len(parts) != 2 {
+		total++
+		addr, proto, ok := netguard.NormalizeProxyAddress(scanner.Text(), protocol)
+		if !ok {
+			dropped++
 			continue
 		}
 		proxies = append(proxies, storage.Proxy{
@@ -292,5 +290,19 @@ func parseProxyList(r io.Reader, protocol string) ([]storage.Proxy, error) {
 			Protocol: proto,
 		})
 	}
+	if dropped > 0 {
+		log.Printf("[fetch] 解析 %d 行，丢弃 %d 行（未知 scheme / 非 IP / 保留地址），入库候选 %d", total, dropped, len(proxies))
+	}
 	return proxies, scanner.Err()
 }
+
+// SourceURLs 返回内置源清单，供运维/测试核对（不再需要读源码）。
+func SourceURLs() []string {
+	out := make([]string, 0, len(allSources))
+	for _, s := range allSources {
+		out = append(out, s.URL)
+	}
+	return out
+}
+
+var _ = strings.TrimSpace

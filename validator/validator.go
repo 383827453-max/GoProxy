@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/net/proxy"
 	"goproxy/config"
+	"goproxy/netguard"
 	"goproxy/storage"
 )
 
@@ -53,9 +54,28 @@ type Result struct {
 	ExitLocation string
 }
 
-// getExitIPInfo 通过代理获取出口 IP 和地理位置
+// getExitIPInfo 通过代理获取出口 IP 和地理位置（多源降级 + 全局限速）。
+//
+// 限速原因：ip-api.com 免费档 45 次/分钟，而验证并发默认 300；不限速时会被瞬间打爆
+// （实测返回 503 Too many open connections），结果所有代理都因"拿不到出口信息"被拒。
 func getExitIPInfo(client *http.Client) (string, string) {
-	// 使用 ip-api.com 返回 JSON 格式的 IP 信息
+	if !netguard.WaitExitIP(3 * time.Second) {
+		return "", ""
+	}
+	if ip, loc := tryIPAPI(client); ip != "" {
+		return ip, loc
+	}
+	if ip, loc := tryIPAPICo(client); ip != "" {
+		return ip, loc
+	}
+	if ip, loc := tryIPInfo(client); ip != "" {
+		return ip, loc
+	}
+	return "", ""
+}
+
+// tryIPAPI 主源：ip-api.com（免费档仅 http，45 次/分钟）
+func tryIPAPI(client *http.Client) (string, string) {
 	resp, err := client.Get("http://ip-api.com/json/?fields=status,country,countryCode,city,query")
 	if err != nil {
 		return "", ""
@@ -64,23 +84,65 @@ func getExitIPInfo(client *http.Client) (string, string) {
 
 	var result struct {
 		Status      string `json:"status"`
-		Query       string `json:"query"`       // IP 地址
+		Query       string `json:"query"`
 		Country     string `json:"country"`
 		CountryCode string `json:"countryCode"`
 		City        string `json:"city"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || result.Status != "success" {
 		return "", ""
 	}
-
-	// 返回格式：IP, "国家代码 城市"
 	location := result.CountryCode
 	if result.City != "" {
 		location = fmt.Sprintf("%s %s", result.CountryCode, result.City)
 	}
-	
 	return result.Query, location
+}
+
+// tryIPAPICo 降级源：ipapi.co（HTTPS）
+func tryIPAPICo(client *http.Client) (string, string) {
+	resp, err := client.Get("https://ipapi.co/json/")
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		IP          string `json:"ip"`
+		City        string `json:"city"`
+		CountryCode string `json:"country_code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", ""
+	}
+	location := result.CountryCode
+	if result.City != "" {
+		location = fmt.Sprintf("%s %s", result.CountryCode, result.City)
+	}
+	return result.IP, location
+}
+
+// tryIPInfo 降级源：ipinfo.io（HTTPS）
+func tryIPInfo(client *http.Client) (string, string) {
+	resp, err := client.Get("https://ipinfo.io/json")
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		IP      string `json:"ip"`
+		City    string `json:"city"`
+		Country string `json:"country"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", ""
+	}
+	location := result.Country
+	if result.City != "" {
+		location = fmt.Sprintf("%s %s", result.Country, result.City)
+	}
+	return result.IP, location
 }
 
 // HTTPS 测试目标列表，随机选一个验证代理的 CONNECT 隧道能力
@@ -202,13 +264,18 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 
 	// 获取出口 IP 和地理位置（仅在验证通过时）
 	exitIP, exitLocation := getExitIPInfo(client)
-	
-	// 必须能获取到出口信息
-	if exitIP == "" || exitLocation == "" {
+
+	// 是否强制要求出口信息：默认要求；在出口查询被限流/目标站不可达时可关闭，
+	// 让代理以 UNKNOWN 地理位置入池（地理过滤随之跳过），避免池子长期为空。
+	requireExit := true
+	if v.cfg != nil {
+		requireExit = v.cfg.RequireExitInfo
+	}
+	if requireExit && (exitIP == "" || exitLocation == "") {
 		return false, latency, exitIP, exitLocation
 	}
-	
-	// 地理过滤：白名单优先，否则走黑名单
+
+	// 地理过滤：白名单优先，否则走黑名单（仅在拿到位置信息时生效）
 	if v.cfg != nil && len(exitLocation) >= 2 {
 		countryCode := exitLocation[:2]
 		if len(v.cfg.AllowedCountries) > 0 {
@@ -241,6 +308,54 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	}
 
 	return true, latency, exitIP, exitLocation
+}
+
+// LookupExitInfo 只为"已入池/候选入池"的代理查询出口信息（受全局限速保护）。
+//
+// 两段式验证的第二步：第一段（ValidateOne）只做连通性 + 延迟 + CONNECT 隧道，
+// 高并发跑完全部候选；第二段只对少量幸存者查出口 IP/位置，
+// 避免把 45 次/分钟的免费额度浪费在几万个死代理上。
+func (v *Validator) LookupExitInfo(p storage.Proxy) (string, string, error) {
+	var client *http.Client
+	var err error
+	switch p.Protocol {
+	case "http":
+		client, err = newHTTPClient(p.Address, v.timeout)
+	case "socks5":
+		client, err = newSOCKS5Client(p.Address, v.timeout)
+	default:
+		return "", "", fmt.Errorf("unknown protocol %s", p.Protocol)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	ip, loc := getExitIPInfo(client)
+	if ip == "" {
+		return "", "", fmt.Errorf("未取到出口信息")
+	}
+	return ip, loc, nil
+}
+
+// IsGeoBlocked 判断出口位置是否命中地理过滤（白名单优先，其次黑名单）。
+func (v *Validator) IsGeoBlocked(exitLocation string) bool {
+	if v.cfg == nil || len(exitLocation) < 2 {
+		return false
+	}
+	cc := exitLocation[:2]
+	if len(v.cfg.AllowedCountries) > 0 {
+		for _, a := range v.cfg.AllowedCountries {
+			if cc == a {
+				return false
+			}
+		}
+		return true
+	}
+	for _, b := range v.cfg.BlockedCountries {
+		if cc == b {
+			return true
+		}
+	}
+	return false
 }
 
 func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) {

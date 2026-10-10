@@ -11,10 +11,31 @@ on:
 env:
   REGISTRY_DOCKERHUB: docker.io
   REGISTRY_GHCR: ghcr.io
-  IMAGE_NAME: isboyjc/goproxy
+  # 用仓库属主而不是硬编码上游账号：fork 后 CI 不会因为无权限推 isboyjc/* 而失败
+  IMAGE_NAME: ${{ github.repository_owner }}/goproxy
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

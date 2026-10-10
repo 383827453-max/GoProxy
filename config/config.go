@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -18,6 +20,35 @@ func dataDir() string {
 	}
 	return ""
 }
+
+// joinBind 把绑定地址与端口合成为 ListenAndServe 可用的地址串。
+// 约定：bind 为空/0.0.0.0/* 表示监听所有网卡；端口若已写成 host:port 则原样沿用。
+func joinBind(bind, port, defaultBind string) string {
+	bind = strings.TrimSpace(bind)
+	if bind == "" {
+		bind = defaultBind
+	}
+	if bind == "0.0.0.0" || bind == "*" {
+		bind = ""
+	}
+	p := strings.TrimSpace(port)
+	if p == "" {
+		return bind
+	}
+	if strings.HasPrefix(p, ":") {
+		return bind + p
+	}
+	if host, _, err := net.SplitHostPort(p); err == nil && host != "" && host != "0.0.0.0" {
+		return p
+	}
+	return net.JoinHostPort(bind, strings.TrimPrefix(p, ":"))
+}
+
+// ProxyAddr 返回 HTTP/SOCKS5 代理端口的实际监听地址。
+func (c *Config) ProxyAddr(port string) string { return joinBind(c.ProxyBind, port, "127.0.0.1") }
+
+// WebUIAddr 返回 WebUI 的实际监听地址。
+func (c *Config) WebUIAddr(port string) string { return joinBind(c.WebUIBind, port, "127.0.0.1") }
 
 func ConfigFile() string { return dataDir() + "config.json" }
 
@@ -46,6 +77,22 @@ type Config struct {
 	ProxyAuthPassword     string // 代理认证密码明文（用于 SOCKS5）
 	ProxyAuthPasswordHash string // 代理认证密码 SHA256 哈希（用于 HTTP）
 
+	// 监听绑定地址（默认 127.0.0.1；设为 0.0.0.0 才会监听所有网卡）
+	ProxyBind string
+	WebUIBind string
+
+	// 出口 IP 查询限速与准入策略
+	ExitIPRateLimit float64 // 次/秒（默认 0.6 ≈ 36 次/分钟，低于 ip-api 免费档 45/分钟）
+	ExitIPBurst     int     // 令牌桶容量（默认 5）
+	RequireExitInfo bool    // 是否强制要求出口 IP/位置（默认 true）
+
+	// 安全参数
+	SessionTTLMinutes    int    // WebUI 会话有效期（分钟，默认 720）
+	LoginMaxAttempts     int    // 同 IP 登录失败上限（默认 10）
+	LoginWindowMinutes   int    // 登录失败统计窗口（分钟，默认 10）
+	AllowPrivateOutbound bool   // 订阅/贡献导入是否允许内网地址（默认 false）
+	ExportToken          string // /api/export 静态令牌（留空则仅管理员会话可用）
+
 	// 地理过滤配置
 	BlockedCountries []string // 屏蔽的国家代码列表（如 ["CN", "RU"]，默认 ["CN"]）
 	AllowedCountries []string // 允许的国家代码列表（白名单，非空时优先于黑名单）
@@ -70,8 +117,8 @@ type Config struct {
 	ValidateURL         string // 验证目标 URL
 
 	// ========== 健康检查配置 ==========
-	HealthCheckInterval   int // 状态监控间隔（分钟）（默认5）
-	HealthCheckBatchSize  int // 每批验证数量（默认20）
+	HealthCheckInterval    int // 状态监控间隔（分钟）（默认5）
+	HealthCheckBatchSize   int // 每批验证数量（默认20）
 	HealthCheckConcurrency int // 批次内并发数（默认50）
 
 	// ========== 优化配置 ==========
@@ -117,13 +164,56 @@ func passwordHash(plain string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(plain)))
 }
 
+func envStr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
+func envInt(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func envFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return def
+	}
+	return f
+}
+
 func DefaultConfig() *Config {
 	// 优先从环境变量 WEBUI_PASSWORD 读取密码，未设置时使用默认密码
 	password := os.Getenv("WEBUI_PASSWORD")
 	if password == "" {
 		password = DefaultPassword
 	}
-	
+
 	// 读取代理认证配置
 	proxyAuthEnabled := os.Getenv("PROXY_AUTH_ENABLED") == "true"
 	proxyAuthUsername := os.Getenv("PROXY_AUTH_USERNAME")
@@ -135,7 +225,7 @@ func DefaultConfig() *Config {
 	if proxyAuthPassword != "" {
 		proxyAuthHash = passwordHash(proxyAuthPassword)
 	}
-	
+
 	// 读取地理过滤配置
 	blockedCountries := []string{"CN"} // 默认屏蔽中国大陆
 	if blockedEnv := os.Getenv("BLOCKED_COUNTRIES"); blockedEnv != "" {
@@ -162,7 +252,7 @@ func DefaultConfig() *Config {
 			}
 		}
 	}
-	
+
 	// 读取订阅代理配置
 	customProxyMode := os.Getenv("CUSTOM_PROXY_MODE")
 	if customProxyMode == "" {
@@ -182,21 +272,37 @@ func DefaultConfig() *Config {
 		SOCKS5Port:        ":7779",
 		StableSOCKS5Port:  ":7780",
 		DBPath:            dataDir() + "proxy.db",
-		
+
 		// 代理认证配置
 		ProxyAuthEnabled:      proxyAuthEnabled,
 		ProxyAuthUsername:     proxyAuthUsername,
 		ProxyAuthPassword:     proxyAuthPassword,
 		ProxyAuthPasswordHash: proxyAuthHash,
-		
+
+		// 监听绑定（默认仅本机；对外暴露必须显式设置 PROXY_BIND/WEBUI_BIND）
+		ProxyBind: envStr("PROXY_BIND", "127.0.0.1"),
+		WebUIBind: envStr("WEBUI_BIND", "127.0.0.1"),
+
+		// 出口 IP 查询限速（ip-api 免费档 45 次/分钟 → 默认 0.6 rps）
+		ExitIPRateLimit: envFloat("EXITIP_RATE_LIMIT", 0.6),
+		ExitIPBurst:     envInt("EXITIP_BURST", 5),
+		RequireExitInfo: envBool("REQUIRE_EXIT_INFO", true),
+
+		// 安全参数
+		SessionTTLMinutes:    envInt("SESSION_TTL_MINUTES", 720),
+		LoginMaxAttempts:     envInt("LOGIN_MAX_ATTEMPTS", 10),
+		LoginWindowMinutes:   envInt("LOGIN_WINDOW_MINUTES", 10),
+		AllowPrivateOutbound: envBool("ALLOW_PRIVATE_OUTBOUND", false),
+		ExportToken:          envStr("EXPORT_TOKEN", ""),
+
 		// 地理过滤配置
 		BlockedCountries: blockedCountries,
 		AllowedCountries: allowedCountries,
 
 		// 池子容量配置
-		PoolMaxSize:        100,  // 总容量
-		PoolHTTPRatio:      0.3,  // HTTP占30%
-		PoolMinPerProtocol: 10,   // 每协议最少10个
+		PoolMaxSize:        100, // 总容量
+		PoolHTTPRatio:      0.3, // HTTP占30%
+		PoolMinPerProtocol: 10,  // 每协议最少10个
 
 		// 延迟标准配置
 		MaxLatencyMs:          2500, // 标准2.5秒
@@ -205,7 +311,7 @@ func DefaultConfig() *Config {
 		MaxLatencyDegradation: 5000, // 降级5秒
 
 		// 验证配置
-		ValidateConcurrency: 300,
+		ValidateConcurrency: 80, // 300 会对免费出口 IP 服务造成瞬间打爆，降到 80
 		ValidateTimeout:     10, // 从8秒增加到10秒
 		ValidateURL:         "http://www.gstatic.com/generate_204",
 
@@ -236,12 +342,12 @@ func DefaultConfig() *Config {
 		SingBoxBasePort:       20000,
 
 		// 兼容旧配置
-		MaxResponseMs: 5000,
-		MaxFailCount:  3,
-		MaxRetry:      3,
-		FetchInterval: 30,
-		CheckInterval: 10,
-		HTTPSourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+		MaxResponseMs:   5000,
+		MaxFailCount:    3,
+		MaxRetry:        3,
+		FetchInterval:   30,
+		CheckInterval:   10,
+		HTTPSourceURL:   "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
 		SOCKS5SourceURL: "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
 	}
 }

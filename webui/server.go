@@ -1,10 +1,14 @@
 package webui
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +18,7 @@ import (
 	"goproxy/config"
 	"goproxy/custom"
 	"goproxy/logger"
+	"goproxy/netguard"
 	"goproxy/pool"
 	"goproxy/storage"
 	"goproxy/validator"
@@ -25,23 +30,108 @@ var (
 	sessionsMu sync.Mutex
 )
 
-func newSession() string {
-	token := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))
+// 登录失败计数（按来源 IP，用于简单的暴力破解退避）
+var (
+	loginFailures = make(map[string]*loginFailure)
+	loginMu       sync.Mutex
+)
+
+type loginFailure struct {
+	count int
+	first time.Time
+}
+
+func (s *Server) sessionTTL() time.Duration {
+	minutes := 720
+	if s != nil && s.cfg != nil && s.cfg.SessionTTLMinutes > 0 {
+		minutes = s.cfg.SessionTTLMinutes
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// newSession 生成会话令牌。
+// 旧实现是 sha256(纳秒时间戳)：没有服务端密钥、熵极低，可在时间窗内枚举伪造。
+// 现在改为 crypto/rand 256 位；随机源不可用时拒绝签发，而不是退回可预测值。
+func (s *Server) newSession() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		log.Printf("[webui] crypto/rand 不可用，拒绝签发会话: %v", err)
+		return ""
+	}
+	token := hex.EncodeToString(buf)
 	sessionsMu.Lock()
-	sessions[token] = time.Now().Add(24 * time.Hour)
+	sessions[token] = time.Now().Add(s.sessionTTL())
 	sessionsMu.Unlock()
 	return token
 }
 
 func validSession(r *http.Request) bool {
 	cookie, err := r.Cookie("session")
-	if err != nil {
+	if err != nil || cookie.Value == "" {
 		return false
 	}
 	sessionsMu.Lock()
 	expiry, ok := sessions[cookie.Value]
+	if ok && !time.Now().Before(expiry) {
+		delete(sessions, cookie.Value)
+		ok = false
+	}
 	sessionsMu.Unlock()
-	return ok && time.Now().Before(expiry)
+	return ok
+}
+
+// clientIP 提取来源 IP（仅用于登录退避统计）。
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// loginAllowed 判断该来源 IP 是否仍在允许尝试的窗口内。
+func (s *Server) loginAllowed(ip string) bool {
+	max, window := 10, 10*time.Minute
+	if s.cfg != nil {
+		if s.cfg.LoginMaxAttempts > 0 {
+			max = s.cfg.LoginMaxAttempts
+		}
+		if s.cfg.LoginWindowMinutes > 0 {
+			window = time.Duration(s.cfg.LoginWindowMinutes) * time.Minute
+		}
+	}
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	f, ok := loginFailures[ip]
+	if !ok {
+		return true
+	}
+	if time.Since(f.first) > window {
+		delete(loginFailures, ip)
+		return true
+	}
+	return f.count < max
+}
+
+func (s *Server) recordLoginFailure(ip string) {
+	window := 10 * time.Minute
+	if s.cfg != nil && s.cfg.LoginWindowMinutes > 0 {
+		window = time.Duration(s.cfg.LoginWindowMinutes) * time.Minute
+	}
+	loginMu.Lock()
+	defer loginMu.Unlock()
+	f, ok := loginFailures[ip]
+	if !ok || time.Since(f.first) > window {
+		loginFailures[ip] = &loginFailure{count: 1, first: time.Now()}
+		return
+	}
+	f.count++
+}
+
+func (s *Server) resetLoginFailures(ip string) {
+	loginMu.Lock()
+	delete(loginFailures, ip)
+	loginMu.Unlock()
 }
 
 type FetchTrigger func()
@@ -68,18 +158,18 @@ func New(s *storage.Storage, cfg *config.Config, pm *pool.Manager, cm *custom.Ma
 
 func (s *Server) Start() {
 	mux := http.NewServeMux()
-	
+
 	// 添加日志中间件
 	loggedMux := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[webui] %s %s | Host: %s | RemoteAddr: %s", 
+		log.Printf("[webui] %s %s | Host: %s | RemoteAddr: %s",
 			r.Method, r.URL.Path, r.Host, r.RemoteAddr)
 		mux.ServeHTTP(w, r)
 	})
-	
+
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/login", s.handleLogin)
 	mux.HandleFunc("/logout", s.handleLogout)
-	
+
 	// 只读 API（访客可访问）
 	mux.HandleFunc("/api/stats", s.readOnlyMiddleware(s.apiStats))
 	mux.HandleFunc("/api/proxies", s.readOnlyMiddleware(s.apiProxies))
@@ -88,7 +178,7 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/pool/quality", s.readOnlyMiddleware(s.apiQualityDistribution))
 	mux.HandleFunc("/api/config", s.readOnlyMiddleware(s.apiConfig))
 	mux.HandleFunc("/api/auth/check", s.apiAuthCheck) // 检查登录状态
-	
+
 	// 管理员 API（需要登录）
 	mux.HandleFunc("/api/proxy/delete", s.authMiddleware(s.apiDeleteProxy))
 	mux.HandleFunc("/api/proxy/refresh", s.authMiddleware(s.apiRefreshProxy))
@@ -99,19 +189,47 @@ func (s *Server) Start() {
 	// 订阅管理 API
 	mux.HandleFunc("/api/subscriptions", s.readOnlyMiddleware(s.apiSubscriptions))
 	mux.HandleFunc("/api/custom/status", s.readOnlyMiddleware(s.apiCustomStatus))
-	mux.HandleFunc("/api/subscription/contribute", s.apiSubscriptionContribute) // 访客可用
+	// 访客贡献会触发服务端主动拉取任意 URL + 落盘，必须管理员权限（原实现免登录 → SSRF/落盘滥用）
+	mux.HandleFunc("/api/subscription/contribute", s.authMiddleware(s.apiSubscriptionContribute))
 	mux.HandleFunc("/api/subscription/add", s.authMiddleware(s.apiSubscriptionAdd))
 	mux.HandleFunc("/api/subscription/delete", s.authMiddleware(s.apiSubscriptionDelete))
 	mux.HandleFunc("/api/subscription/refresh", s.authMiddleware(s.apiSubscriptionRefresh))
 	mux.HandleFunc("/api/subscription/refresh-all", s.authMiddleware(s.apiSubscriptionRefreshAll))
 	mux.HandleFunc("/api/subscription/toggle", s.authMiddleware(s.apiSubscriptionToggle))
 
-	log.Printf("WebUI listening on %s", s.cfg.WebUIPort)
+	// 代理导出（给 opencode2 / clash 等下游消费；需要管理员会话或 EXPORT_TOKEN）
+	mux.HandleFunc("/api/export", s.exportMiddleware(s.apiExport))
+
+	addr := s.cfg.WebUIAddr(s.cfg.WebUIPort)
+	log.Printf("WebUI listening on %s", addr)
 	go func() {
-		if err := http.ListenAndServe(s.cfg.WebUIPort, loggedMux); err != nil {
+		if err := http.ListenAndServe(addr, loggedMux); err != nil {
 			log.Fatalf("webui: %v", err)
 		}
 	}()
+}
+
+// exportMiddleware 导出接口鉴权：管理员会话，或 X-Export-Token 与 EXPORT_TOKEN 匹配。
+func (s *Server) exportMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if validSession(r) {
+			next(w, r)
+			return
+		}
+		token := r.Header.Get("X-Export-Token")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		want := ""
+		if s.cfg != nil {
+			want = s.cfg.ExportToken
+		}
+		if want == "" || subtle.ConstantTimeCompare([]byte(token), []byte(want)) != 1 {
+			jsonError(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // authMiddleware 管理员权限中间件（必须登录）
@@ -150,19 +268,36 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	password := r.FormValue("password")
+	ip := clientIP(r)
+	if !s.loginAllowed(ip) {
+		log.Printf("[webui] 登录尝试过于频繁，已临时拒绝: %s", ip)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprint(w, loginHTMLWithError)
+		return
+	}
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
-	if hash != s.cfg.WebUIPasswordHash {
+	// 常量时间比较，避免通过响应时间推断口令哈希
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(s.cfg.WebUIPasswordHash)) != 1 {
+		s.recordLoginFailure(ip)
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, loginHTMLWithError)
 		return
 	}
-	token := newSession()
+	s.resetLoginFailures(ip)
+	token := s.newSession()
+	if token == "" {
+		http.Error(w, "session unavailable", http.StatusInternalServerError)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    token,
 		Path:     "/",
-		Expires:  time.Now().Add(24 * time.Hour),
+		Expires:  time.Now().Add(s.sessionTTL()),
 		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
 	})
 	http.Redirect(w, r, "/", http.StatusFound)
 }
@@ -182,7 +317,7 @@ func (s *Server) apiAuthCheck(w http.ResponseWriter, r *http.Request) {
 	isAdmin := validSession(r)
 	jsonOK(w, map[string]interface{}{
 		"isAdmin": isAdmin,
-		"mode":    func() string {
+		"mode": func() string {
 			if isAdmin {
 				return "admin"
 			}
@@ -256,7 +391,7 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to get proxy", http.StatusInternalServerError)
 		return
 	}
-	
+
 	var targetProxy *storage.Proxy
 	for i := range proxies {
 		if proxies[i].Address == req.Address {
@@ -264,7 +399,7 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	
+
 	if targetProxy == nil {
 		jsonError(w, "proxy not found", http.StatusNotFound)
 		return
@@ -274,10 +409,10 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		cfg := config.Get()
 		v := validator.New(1, cfg.ValidateTimeout, cfg.ValidateURL)
-		
+
 		log.Printf("[webui] refreshing proxy: %s", req.Address)
 		valid, latency, exitIP, exitLocation := v.ValidateOne(*targetProxy)
-		
+
 		if valid {
 			latencyMs := int(latency.Milliseconds())
 			s.storage.UpdateExitInfo(req.Address, exitIP, exitLocation, latencyMs)
@@ -354,35 +489,35 @@ func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	httpSlots, socks5Slots := cfg.CalculateSlots()
-	
+
 	jsonOK(w, map[string]interface{}{
 		// 池子配置
-		"pool_max_size":        cfg.PoolMaxSize,
-		"pool_http_ratio":      cfg.PoolHTTPRatio,
+		"pool_max_size":         cfg.PoolMaxSize,
+		"pool_http_ratio":       cfg.PoolHTTPRatio,
 		"pool_min_per_protocol": cfg.PoolMinPerProtocol,
-		"pool_http_slots":      httpSlots,
-		"pool_socks5_slots":    socks5Slots,
+		"pool_http_slots":       httpSlots,
+		"pool_socks5_slots":     socks5Slots,
 
 		// 延迟配置
-		"max_latency_ms":         cfg.MaxLatencyMs,
-		"max_latency_emergency":  cfg.MaxLatencyEmergency,
-		"max_latency_healthy":    cfg.MaxLatencyHealthy,
+		"max_latency_ms":        cfg.MaxLatencyMs,
+		"max_latency_emergency": cfg.MaxLatencyEmergency,
+		"max_latency_healthy":   cfg.MaxLatencyHealthy,
 
 		// 验证配置
-		"validate_concurrency":   cfg.ValidateConcurrency,
-		"validate_timeout":       cfg.ValidateTimeout,
+		"validate_concurrency": cfg.ValidateConcurrency,
+		"validate_timeout":     cfg.ValidateTimeout,
 
 		// 健康检查配置
-		"health_check_interval":  cfg.HealthCheckInterval,
+		"health_check_interval":   cfg.HealthCheckInterval,
 		"health_check_batch_size": cfg.HealthCheckBatchSize,
 
 		// 优化配置
-		"optimize_interval":      cfg.OptimizeInterval,
-		"replace_threshold":      cfg.ReplaceThreshold,
+		"optimize_interval": cfg.OptimizeInterval,
+		"replace_threshold": cfg.ReplaceThreshold,
 
 		// 地理过滤配置
-		"blocked_countries":      cfg.BlockedCountries,
-		"allowed_countries":      cfg.AllowedCountries,
+		"blocked_countries": cfg.BlockedCountries,
+		"allowed_countries": cfg.AllowedCountries,
 
 		// 自定义订阅代理配置
 		"custom_proxy_mode":       cfg.CustomProxyMode,
@@ -586,6 +721,15 @@ func (s *Server) apiSubscriptionContribute(w http.ResponseWriter, r *http.Reques
 		req.Name = "贡献订阅"
 	}
 
+	// SSRF 防护：提交的 URL 会被服务端主动拉取，必须先过 netguard
+	if req.URL != "" {
+		allowPrivate := s.cfg != nil && s.cfg.AllowPrivateOutbound
+		if err := netguard.GuardOutboundURL(req.URL, allowPrivate); err != nil {
+			jsonError(w, "订阅 URL 被拒绝: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
 	// 如果上传了文件，保存到本地
 	filePath := ""
 	if req.FileContent != "" {
@@ -594,9 +738,13 @@ func (s *Server) apiSubscriptionContribute(w http.ResponseWriter, r *http.Reques
 			dataDir = "."
 		}
 		subDir := filepath.Join(dataDir, "subscriptions")
-		os.MkdirAll(subDir, 0755)
+		if err := os.MkdirAll(subDir, 0700); err != nil {
+			jsonError(w, "创建订阅目录失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		filePath = filepath.Join(subDir, fmt.Sprintf("contribute_%d.yaml", time.Now().UnixMilli()))
-		if err := os.WriteFile(filePath, []byte(req.FileContent), 0644); err != nil {
+		// 0600：订阅文件里通常含节点口令，不能让同机其他用户可读
+		if err := os.WriteFile(filePath, []byte(req.FileContent), 0600); err != nil {
 			jsonError(w, "保存文件失败: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
