@@ -1,8 +1,11 @@
 package main
 
 import (
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +15,7 @@ import (
 	"goproxy/custom"
 	"goproxy/fetcher"
 	"goproxy/logger"
+	"goproxy/netguard"
 	"goproxy/optimizer"
 	"goproxy/pool"
 	"goproxy/proxy"
@@ -47,7 +51,8 @@ func main() {
 	}
 	defer store.Close()
 
-	// 初始化限流器
+	// 初始化限流器（出口 IP 查询：ip-api 免费档 45 次/分钟，必须全局限速）
+	netguard.InitExitIPLimiter(cfg.ExitIPRateLimit, cfg.ExitIPBurst)
 	fetcher.InitIPQueryLimiter(cfg.IPQueryRateLimit)
 
 	// 初始化核心模块
@@ -57,7 +62,7 @@ func main() {
 	poolMgr := pool.NewManager(store, cfg)
 	healthChecker := checker.NewHealthChecker(store, validate, cfg, poolMgr)
 	opt := optimizer.NewOptimizer(store, fetch, validate, poolMgr, cfg)
-	
+
 	// 清理无效代理（免费代理删除，订阅代理禁用）
 	totalDeleted := 0
 	if len(cfg.AllowedCountries) > 0 {
@@ -81,11 +86,16 @@ func main() {
 		log.Printf("[main] 🧹 已清理 %d 个无出口信息的代理", deleted)
 		totalDeleted += int(deleted)
 	}
-	
+	// 清理长期未通过出口验证的候选（pending），避免占着槽位
+	if deleted, err := store.DeleteStalePending(60); err == nil && deleted > 0 {
+		log.Printf("[main] 🧹 已清理 %d 个超时未验证的候选代理(pending)", deleted)
+		totalDeleted += int(deleted)
+	}
+
 	// 创建 HTTP 代理服务器：随机轮换 + 最低延迟
 	randomServer := proxy.New(store, cfg, "random", cfg.ProxyPort)
 	stableServer := proxy.New(store, cfg, "lowest-latency", cfg.StableProxyPort)
-	
+
 	// 创建 SOCKS5 代理服务器：随机轮换 + 最低延迟
 	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port)
 	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port)
@@ -223,7 +233,9 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		cfg := config.Get()
 		maxLatency := cfg.GetLatencyThreshold(status.State)
 
-		if result.ExitIP == "" || result.ExitLocation == "" {
+		// 出口信息为"可选"时（REQUIRE_EXIT_INFO=false），先按连通性入池，
+		// 再由 enrichExitInfo 在后台用限速额度补齐位置并做地理过滤。
+		if cfg.RequireExitInfo && (result.ExitIP == "" || result.ExitLocation == "") {
 			rejectedNoExit.Add(1)
 			return
 		}
@@ -243,6 +255,9 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 
 		if added, reason := poolMgr.TryAddProxy(proxyToAdd); added {
 			addedCount.Add(1)
+			if proxyToAdd.ExitIP == "" {
+				go enrichExitInfo(validate, store, proxyToAdd)
+			}
 		} else if reason == "slots_full" {
 			rejectedFull.Add(1)
 		} else if len(result.ExitLocation) >= 2 {
@@ -308,6 +323,69 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		len(candidates), validCount.Load(), addedCount.Load(),
 		rejectedNoExit.Load(), rejectedLatency.Load(), rejectedGeo.Load(), rejectedFull.Load(),
 		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
+}
+
+// selfEgressIP 本机真实出口 IP（用于识别"透明代理/劫持"：代理报出的出口 IP 等于本机 IP
+// 说明流量其实没走代理）。只取一次，失败则跳过该项检查。
+var (
+	selfIPOnce sync.Once
+	selfIP     string
+)
+
+func selfEgressIP() string {
+	selfIPOnce.Do(func() {
+		client := &http.Client{Timeout: 8 * time.Second}
+		resp, err := client.Get("https://api.ipify.org")
+		if err != nil {
+			log.Printf("[enrich] 取本机出口 IP 失败（跳过透明代理检测）: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		if err != nil {
+			return
+		}
+		selfIP = strings.TrimSpace(string(b))
+		log.Printf("[enrich] 本机出口 IP: %s", selfIP)
+	})
+	return selfIP
+}
+
+// enrichExitInfo 后台补齐出口信息（两段式验证的第二段）。
+//
+// 第一段只做连通性 + 延迟，高并发跑完上万候选；第二段只对真正入池的少数代理
+// 查询出口 IP/位置，且全程受 netguard 全局限速（默认 0.6 rps ≈ 36 次/分钟，
+// 低于 ip-api 免费档 45 次/分钟），避免把免费额度浪费在死代理上。
+//
+// 状态流转：pending → active（出口信息齐全且未命中地理过滤/非透明代理）
+//
+//	pending → 保持 pending（查询失败，由 DeleteStalePending 超时清理）
+//	pending → disabled（命中地理过滤）
+func enrichExitInfo(validate *validator.Validator, store *storage.Storage, p storage.Proxy) {
+	ip, loc, err := validate.LookupExitInfo(p)
+	if err != nil || ip == "" {
+		store.IncrFail(p.Address)
+		return
+	}
+	// 透明代理检测：出口 IP 与本机相同 → 流量根本没走代理
+	if mine := selfEgressIP(); mine != "" && ip == mine {
+		log.Printf("[enrich] ⚠️ %s 出口 IP 与本机相同（透明代理/劫持），移除", p.Address)
+		store.Delete(p.Address)
+		return
+	}
+	if err := store.UpdateExitInfo(p.Address, ip, loc, p.Latency); err != nil {
+		log.Printf("[enrich] 写入出口信息失败 %s: %v", p.Address, err)
+		return
+	}
+	if validate.IsGeoBlocked(loc) {
+		if err := store.DisableProxy(p.Address); err == nil {
+			log.Printf("[enrich] 🚫 %s 出口 %s 命中地理过滤，已禁用", p.Address, loc)
+		}
+		return
+	}
+	if err := store.SetStatus(p.Address, "active"); err == nil {
+		log.Printf("[enrich] ✅ %s 出口 %s (%s) → active", p.Address, ip, loc)
+	}
 }
 
 // startStatusMonitor 状态监控协程

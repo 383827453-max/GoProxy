@@ -28,6 +28,15 @@ services:
       - ALLOWED_COUNTRIES=${ALLOWED_COUNTRIES}
       - CUSTOM_PROXY_MODE=${CUSTOM_PROXY_MODE:-mixed}
       - SINGBOX_PATH=sing-box
+      # 加固相关：容器内监听所有网卡（由 Dockerfile 默认给出），
+      # 宿主机侧建议只映射到 127.0.0.1 并开启 PROXY_AUTH_ENABLED
+      - PROXY_BIND=${PROXY_BIND:-0.0.0.0}
+      - WEBUI_BIND=${WEBUI_BIND:-0.0.0.0}
+      - EXITIP_RATE_LIMIT=${EXITIP_RATE_LIMIT:-0.6}
+      - EXITIP_BURST=${EXITIP_BURST:-5}
+      - REQUIRE_EXIT_INFO=${REQUIRE_EXIT_INFO:-false}
+      - EXPORT_TOKEN=${EXPORT_TOKEN}
+      - ALLOW_PRIVATE_OUTBOUND=${ALLOW_PRIVATE_OUTBOUND:-false}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:7778/ || exit 1"]
       interval: 30s

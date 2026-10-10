@@ -1,7 +1,6 @@
 package custom
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -15,17 +14,18 @@ import (
 
 	"golang.org/x/net/proxy"
 	"goproxy/config"
+	"goproxy/netguard"
 	"goproxy/storage"
 	"goproxy/validator"
 )
 
 // Manager 订阅管理器
 type Manager struct {
-	storage    *storage.Storage
-	validator  *validator.Validator
-	singbox    *SingBoxProcess
-	stopCh     chan struct{}
-	refreshMu  sync.Mutex // 防止并发刷新
+	storage   *storage.Storage
+	validator *validator.Validator
+	singbox   *SingBoxProcess
+	stopCh    chan struct{}
+	refreshMu sync.Mutex // 防止并发刷新
 }
 
 // NewManager 创建订阅管理器
@@ -386,6 +386,15 @@ func (m *Manager) fetchSubscriptionData(sub *storage.Subscription) ([]byte, erro
 
 // fetchWithRetry 尝试拉取 URL（直连 → 代理，多种方式）
 func (m *Manager) fetchWithRetry(urlStr string) ([]byte, error) {
+	// SSRF 防护：服务端主动拉取的 URL 必须先过 netguard（禁内网/保留段/非 http(s)）
+	allowPrivate := false
+	if cfg := config.Get(); cfg != nil {
+		allowPrivate = cfg.AllowPrivateOutbound
+	}
+	if err := netguard.GuardOutboundURL(urlStr, allowPrivate); err != nil {
+		return nil, fmt.Errorf("订阅 URL 被拒绝: %w", err)
+	}
+
 	// 先尝试直连
 	data, err := m.fetchURL(urlStr, nil)
 	if err == nil {
@@ -415,9 +424,8 @@ func (m *Manager) fetchURL(urlStr string, p *storage.Proxy) ([]byte, error) {
 	transport := &http.Transport{}
 
 	if p != nil {
-		// 通过代理访问时跳过 TLS 验证（免费代理可能 MITM）
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
+		// 注意：这里**不**关闭 TLS 校验。旧实现用 InsecureSkipVerify=true
+		// 来"兼容免费代理"，等于把订阅内容交给链路中间人任意替换。
 		switch p.Protocol {
 		case "socks5":
 			dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
@@ -500,10 +508,10 @@ func (m *Manager) GetStatus() map[string]interface{} {
 	subs, _ := m.storage.GetSubscriptions()
 
 	return map[string]interface{}{
-		"singbox_running":   m.singbox.IsRunning(),
-		"singbox_nodes":     m.singbox.GetNodeCount(),
-		"custom_count":      customCount,
-		"disabled_count":    len(disabled),
+		"singbox_running":    m.singbox.IsRunning(),
+		"singbox_nodes":      m.singbox.GetNodeCount(),
+		"custom_count":       customCount,
+		"disabled_count":     len(disabled),
 		"subscription_count": len(subs),
 	}
 }

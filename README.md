@@ -263,6 +263,28 @@ main.go                    # 入口，协调所有模块
 - [测试脚本](test/README.md) — HTTP + SOCKS5 测试脚本
 - [更新日志](CHANGELOG.md) — 版本历史
 
+## 安全加固与自托管部署（pool-hardening）
+
+本仓库在上游 v0.4.1 基础上做了加固，默认姿态从"部署即公网开放代理"改为"仅本机 + 强制认证"：
+
+- **两段式验证**：先按连通性 + 延迟高并发筛，入池后再用限速额度补齐出口 IP/位置（解决 ip-api 免费档 45 次/分钟被打爆、池子长期为 0 的问题）
+- **默认只监听 `127.0.0.1`**（`PROXY_BIND` / `WEBUI_BIND`），代理端口默认开启认证
+- **SSRF 防护**：订阅/贡献导入的 URL 必须过 `netguard`（禁内网/保留段/非 http(s)），访客贡献接口改为管理员权限
+- **会话与登录**：`crypto/rand` 会话令牌、常量时间口令比较、登录失败退避
+- **新增 `GET /api/export`**：一键导出池内可用代理（`uri|plain|json`），供 opencode2api / clash 等下游消费
+- **依赖升级**：`golang.org/x/net` → v0.61.0（修 GO-2026-6617）、go-sqlite3 → v1.14.52、Go 1.26
+- **移除仓库内泄漏物**：13 MB macOS 二进制 `proxygo` 与含真实节点口令的订阅 YAML
+
+部署与下游集成步骤见 [`deploy/README-DEPLOY.md`](deploy/README-DEPLOY.md)，改动明细见 [`CHANGELOG-HARDENING.md`](CHANGELOG-HARDENING.md)。
+
+```bash
+# 目标机（Ubuntu 24.04）一键部署（幂等）
+REPO=https://github.com/<you>/GoProxy.git BRANCH=main bash deploy/install-vm2.sh
+
+# 把已验证代理导入 opencode2api 的公开补充池（幂等，不动商业 master 池）
+EXPORT_TOKEN=$(sudo sed -n 's/^EXPORT_TOKEN=//p' /etc/goproxy/goproxy.env) bash deploy/export-to-opencode2.sh
+```
+
 ## 免责声明
 
 本项目仅供学习交流和技术研究使用。

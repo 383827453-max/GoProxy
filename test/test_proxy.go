@@ -36,17 +36,17 @@ func countryToEmoji(countryCode string) string {
 	if countryCode == "" {
 		return "🌐"
 	}
-	
+
 	countryCode = strings.ToUpper(countryCode)
 	if len(countryCode) != 2 {
 		return "🌐"
 	}
-	
+
 	// 将国家代码转换为 emoji
 	// A=127462, 所以 'US' -> 🇺🇸
 	first := rune(countryCode[0]) - 'A' + 127462
 	second := rune(countryCode[1]) - 'A' + 127462
-	
+
 	return string([]rune{first, second})
 }
 
@@ -117,6 +117,6 @@ func main() {
 	if len(os.Args) > 1 {
 		proxyPort = os.Args[1]
 	}
-	
+
 	testHTTPProxyContinuous()
 }

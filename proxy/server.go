@@ -43,8 +43,9 @@ func (s *Server) Start() error {
 	if s.cfg.ProxyAuthEnabled {
 		authStatus = fmt.Sprintf("需认证 (用户: %s)", s.cfg.ProxyAuthUsername)
 	}
-	log.Printf("proxy server listening on %s [%s] [%s]", s.port, modeDesc, authStatus)
-	return http.ListenAndServe(s.port, s)
+	addr := s.cfg.ProxyAddr(s.port)
+	log.Printf("proxy server listening on %s [%s] [%s]", addr, modeDesc, authStatus)
+	return http.ListenAndServe(addr, s)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +57,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	
+
 	if r.Method == http.MethodConnect {
 		s.handleTunnel(w, r)
 	} else {
@@ -70,31 +71,31 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	if auth == "" {
 		return false
 	}
-	
+
 	// 解析 Basic Auth
 	const prefix = "Basic "
 	if !strings.HasPrefix(auth, prefix) {
 		return false
 	}
-	
+
 	decoded, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
 	if err != nil {
 		return false
 	}
-	
+
 	credentials := strings.SplitN(string(decoded), ":", 2)
 	if len(credentials) != 2 {
 		return false
 	}
-	
+
 	username := credentials[0]
 	password := credentials[1]
-	
+
 	// 验证用户名和密码
 	usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.ProxyAuthUsername)) == 1
 	passwordHash := fmt.Sprintf("%x", sha256.Sum256([]byte(password)))
 	passwordMatch := subtle.ConstantTimeCompare([]byte(passwordHash), []byte(s.cfg.ProxyAuthPasswordHash)) == 1
-	
+
 	return usernameMatch && passwordMatch
 }
 

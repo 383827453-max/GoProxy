@@ -6,6 +6,7 @@ Thumbs.db
 
 # Go build artifacts
 goproxy
+proxygo
 proxy-pool
 *.exe
 *.out
@@ -26,6 +27,10 @@ test/test_proxy.exe
 config.json
 data/
 !data/.gitkeep
+
+# 订阅文件含节点口令，禁止入库（历史提交里曾泄漏过一份可用的订阅凭据）
+subscriptions/
+!subscriptions/.gitkeep
 
 # Environment variables
 .env

@@ -127,8 +127,8 @@ func looksLikeProxyLinks(s string) bool {
 
 // clashConfig Clash YAML 配置结构（兼容新旧格式）
 type clashConfig struct {
-	Proxies    []map[string]interface{} `yaml:"proxies"`
-	ProxyOld   []map[string]interface{} `yaml:"Proxy"`    // 旧版 Clash 格式
+	Proxies  []map[string]interface{} `yaml:"proxies"`
+	ProxyOld []map[string]interface{} `yaml:"Proxy"` // 旧版 Clash 格式
 }
 
 // getProxies 兼容获取代理列表
@@ -321,7 +321,7 @@ func parseClashProxy(proxy map[string]interface{}) (*ParsedNode, error) {
 		"shadowsocks": true, "shadowsocksr": true,
 		"hysteria": true, "hysteria2": true, "tuic": true,
 		"anytls": true,
-		"http": true, "socks5": true,
+		"http":   true, "socks5": true,
 	}
 	if !supported[typ] {
 		return nil, fmt.Errorf("不支持的代理类型: %s", typ)
@@ -472,13 +472,13 @@ func parseVmessLink(link string) (*ParsedNode, error) {
 
 	// 构建 Clash 兼容的 raw 配置
 	raw := map[string]interface{}{
-		"type":   "vmess",
-		"name":   name,
-		"server": server,
-		"port":   port,
-		"uuid":   fmt.Sprintf("%v", info["id"]),
+		"type":    "vmess",
+		"name":    name,
+		"server":  server,
+		"port":    port,
+		"uuid":    fmt.Sprintf("%v", info["id"]),
 		"alterId": getInt(info, "aid"),
-		"cipher": getStrDefault(info, "scy", "auto"),
+		"cipher":  getStrDefault(info, "scy", "auto"),
 	}
 
 	// TLS

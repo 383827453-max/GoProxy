@@ -172,6 +172,14 @@ func (m *Manager) TryAddProxy(p storage.Proxy) (bool, string) {
 		}
 		// 更新完整信息
 		m.storage.UpdateExitInfo(p.Address, p.ExitIP, p.ExitLocation, p.Latency)
+		// 出口信息还没拿到 → 先置为 pending（不参与对外转发），
+		// 由 enrichExitInfo 补齐后再转 active。避免把未验证代理直接给下游用。
+		if p.ExitIP == "" || p.ExitLocation == "" {
+			m.storage.SetStatus(p.Address, "pending")
+			log.Printf("[pool] 🕒 候选入池(pending): %s (%s %d/%d) %dms",
+				p.Address, p.Protocol, currentCount+1, maxSlots, p.Latency)
+			return true, "added_pending"
+		}
 		log.Printf("[pool] ✅ 直接入池: %s (%s %d/%d) %dms %s %s",
 			p.Address, p.Protocol, currentCount+1, maxSlots, p.Latency, p.ExitIP, p.ExitLocation)
 		return true, "added"

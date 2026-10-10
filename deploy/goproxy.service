@@ -1,0 +1,39 @@
+[Unit]
+Description=GoProxy intelligent proxy pool (HTTP/SOCKS5 gateway)
+Documentation=https://github.com/383827453-max/GoProxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/goproxy
+EnvironmentFile=/etc/goproxy/goproxy.env
+ExecStart=/home/azureuser/goproxy/proxy-pool
+Restart=always
+RestartSec=5
+# 日志走 journald：journalctl -u goproxy -f
+StandardOutput=journal
+StandardError=journal
+
+# ---- 加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/home/azureuser/goproxy/data /home/azureuser/goproxy/subscriptions
+# 允许监听高端口；不授予任何额外 capability
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
