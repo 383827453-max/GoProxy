@@ -1,8 +1,11 @@
 package main
 
 import (
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,6 +84,11 @@ func main() {
 	}
 	if deleted, err := store.DeleteWithoutExitInfo(); err == nil && deleted > 0 {
 		log.Printf("[main] 🧹 已清理 %d 个无出口信息的代理", deleted)
+		totalDeleted += int(deleted)
+	}
+	// 清理长期未通过出口验证的候选（pending），避免占着槽位
+	if deleted, err := store.DeleteStalePending(60); err == nil && deleted > 0 {
+		log.Printf("[main] 🧹 已清理 %d 个超时未验证的候选代理(pending)", deleted)
 		totalDeleted += int(deleted)
 	}
 
@@ -317,15 +325,52 @@ func smartFetchAndFill(fetch *fetcher.Fetcher, validate *validator.Validator, st
 		finalStatus.State, finalStatus.HTTP, finalStatus.SOCKS5)
 }
 
+// selfEgressIP 本机真实出口 IP（用于识别"透明代理/劫持"：代理报出的出口 IP 等于本机 IP
+// 说明流量其实没走代理）。只取一次，失败则跳过该项检查。
+var (
+	selfIPOnce sync.Once
+	selfIP     string
+)
+
+func selfEgressIP() string {
+	selfIPOnce.Do(func() {
+		client := &http.Client{Timeout: 8 * time.Second}
+		resp, err := client.Get("https://api.ipify.org")
+		if err != nil {
+			log.Printf("[enrich] 取本机出口 IP 失败（跳过透明代理检测）: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		if err != nil {
+			return
+		}
+		selfIP = strings.TrimSpace(string(b))
+		log.Printf("[enrich] 本机出口 IP: %s", selfIP)
+	})
+	return selfIP
+}
+
 // enrichExitInfo 后台补齐出口信息（两段式验证的第二段）。
 //
 // 第一段只做连通性 + 延迟，高并发跑完上万候选；第二段只对真正入池的少数代理
 // 查询出口 IP/位置，且全程受 netguard 全局限速（默认 0.6 rps ≈ 36 次/分钟，
 // 低于 ip-api 免费档 45 次/分钟），避免把免费额度浪费在死代理上。
-// 命中地理过滤的代理直接禁用（保留探测唤醒机会，不硬删）。
+//
+// 状态流转：pending → active（出口信息齐全且未命中地理过滤/非透明代理）
+//
+//	pending → 保持 pending（查询失败，由 DeleteStalePending 超时清理）
+//	pending → disabled（命中地理过滤）
 func enrichExitInfo(validate *validator.Validator, store *storage.Storage, p storage.Proxy) {
 	ip, loc, err := validate.LookupExitInfo(p)
 	if err != nil || ip == "" {
+		store.IncrFail(p.Address)
+		return
+	}
+	// 透明代理检测：出口 IP 与本机相同 → 流量根本没走代理
+	if mine := selfEgressIP(); mine != "" && ip == mine {
+		log.Printf("[enrich] ⚠️ %s 出口 IP 与本机相同（透明代理/劫持），移除", p.Address)
+		store.Delete(p.Address)
 		return
 	}
 	if err := store.UpdateExitInfo(p.Address, ip, loc, p.Latency); err != nil {
@@ -338,7 +383,9 @@ func enrichExitInfo(validate *validator.Validator, store *storage.Storage, p sto
 		}
 		return
 	}
-	log.Printf("[enrich] ✅ %s 出口 %s (%s)", p.Address, ip, loc)
+	if err := store.SetStatus(p.Address, "active"); err == nil {
+		log.Printf("[enrich] ✅ %s 出口 %s (%s) → active", p.Address, ip, loc)
+	}
 }
 
 // startStatusMonitor 状态监控协程

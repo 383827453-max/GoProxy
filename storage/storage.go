@@ -1185,6 +1185,30 @@ func scanSubscription(rows *sql.Rows) (*Subscription, error) {
 }
 
 // Close 关闭数据库
+// SetStatus 更新代理状态（active / degraded / disabled / pending）。
+//
+// pending 表示"连通性已通过、但出口信息尚未验证"的候选代理：
+// 选择代理的 SQL 只认 active/degraded，因此 pending 不会被对外转发使用，
+// 避免把劫持页或死代理塞给下游。
+func (s *Storage) SetStatus(address, status string) error {
+	_, err := s.db.Exec(`UPDATE proxies SET status = ? WHERE address = ?`, status, address)
+	return err
+}
+
+// DeleteStalePending 清理长期停留在 pending 的候选（默认超过 60 分钟仍拿不到出口信息）。
+func (s *Storage) DeleteStalePending(maxAgeMinutes int) (int64, error) {
+	if maxAgeMinutes <= 0 {
+		maxAgeMinutes = 60
+	}
+	res, err := s.db.Exec(
+		`DELETE FROM proxies WHERE status = 'pending' AND created_at < datetime('now', ?)`,
+		fmt.Sprintf("-%d minutes", maxAgeMinutes))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *Storage) Close() error {
 	return s.db.Close()
 }

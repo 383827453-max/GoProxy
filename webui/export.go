@@ -17,6 +17,7 @@ import (
 //
 //	?protocol=socks5|http|all   默认 all
 //	?source=free|custom|all     默认 all
+//	?status=active|all          默认 active（排除 pending/degraded/disabled，只给下游能用的）
 //	?format=uri|plain|json      默认 uri（uri 形如 socks5://1.2.3.4:1080）
 //	?max_latency=3000           只导出延迟不超过该值的代理（毫秒，0=不限）
 //	?min_grade=S|A|B|C          只导出该等级及以上（S 最优）
@@ -32,6 +33,10 @@ func (s *Server) apiExport(w http.ResponseWriter, r *http.Request) {
 	source := strings.ToLower(strings.TrimSpace(q.Get("source")))
 	if source == "" {
 		source = "all"
+	}
+	status := strings.ToLower(strings.TrimSpace(q.Get("status")))
+	if status == "" {
+		status = "active"
 	}
 	format := strings.ToLower(strings.TrimSpace(q.Get("format")))
 	if format == "" {
@@ -61,7 +66,12 @@ func (s *Server) apiExport(w http.ResponseWriter, r *http.Request) {
 		if protocol != "all" && p.Protocol != protocol {
 			continue
 		}
-		if p.Status != "" && p.Status != "active" && p.Status != "degraded" {
+		// 默认只导出 active：pending（出口未验证）/disabled（地理或探测禁用）都不给下游
+		if status != "all" {
+			if p.Status != status {
+				continue
+			}
+		} else if p.Status != "" && p.Status != "active" && p.Status != "degraded" {
 			continue
 		}
 		if p.FailCount >= 3 {
@@ -88,6 +98,7 @@ func (s *Server) apiExport(w http.ResponseWriter, r *http.Request) {
 			"count":    len(out),
 			"protocol": protocol,
 			"source":   source,
+			"status":   status,
 			"proxies":  out,
 		})
 	case "plain":
