@@ -94,9 +94,10 @@ type Config struct {
 	ExportToken          string // /api/export 静态令牌（留空则仅管理员会话可用）
 
 	// ========== 三态健康策略与复活 ==========
-	FailureThreshold int // 连续失败达到该次数才移除（默认 5；之前硬编码为 3）
-	ReanimateBatch   int // 每轮健康检查最多探测多少个已禁用代理（默认 10）
-	MaxPending       int // pending 候选上限（默认 50）：出口验证速度有限，积压超限就暂停入池
+	FailureThreshold      int // 连续失败达到该次数才移除（默认 5；之前硬编码为 3）
+	ReanimateBatch        int // 每轮健康检查最多探测多少个已禁用代理（默认 10）
+	MaxPending            int // pending 候选上限（默认 50）：出口验证速度有限，积压超限就暂停入池
+	OptimizeMaxCandidates int // 每轮优化最多验证多少候选（默认 3000，防止一轮跑成小时级）
 
 	// ========== 出口去重 / 同 C 段限制 ==========
 	ExitSubnetCooldownSeconds int // 同一出口 /24 的冷却时间（秒，默认 60；0=关闭该特性）
@@ -306,9 +307,10 @@ func DefaultConfig() *Config {
 		ExportToken:          envStr("EXPORT_TOKEN", ""),
 
 		// 三态健康策略与复活
-		FailureThreshold: envInt("FAILURE_THRESHOLD", 5),
-		ReanimateBatch:   envInt("REANIMATE_BATCH", 10),
-		MaxPending:       envInt("MAX_PENDING", 50),
+		FailureThreshold:      envInt("FAILURE_THRESHOLD", 5),
+		ReanimateBatch:        envInt("REANIMATE_BATCH", 10),
+		MaxPending:            envInt("MAX_PENDING", 50),
+		OptimizeMaxCandidates: envInt("OPTIMIZE_MAX_CANDIDATES", 3000),
 
 		// 出口去重 / 同 C 段限制
 		ExitSubnetCooldownSeconds: envInt("EXIT_SUBNET_COOLDOWN_SECONDS", 60),

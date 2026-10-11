@@ -132,6 +132,78 @@ func TestSubnetExclusionInSelection(t *testing.T) {
 	}
 }
 
+func TestHealthCheckNotBlindSpotWhenAllGradeS(t *testing.T) {
+	s := newTestStorage(t)
+	// 造 3 条 S 级（低延迟）active 代理 —— 这正是线上实测出现的"整池都是 S 级"场景
+	for _, a := range []string{"1.1.1.1:1080", "2.2.2.2:1080", "3.3.3.3:1080"} {
+		if err := s.AddProxyWithSource(a, "socks5", "free"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateExitInfo(a, a[:len(a)-5], "US Test", 100); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetStatus(a, "active"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 全部为 S 级时，"跳过 S 级"的候选数为 0 → 调用方据此判断不应跳过
+	nonS, err := s.CountCheckable(true, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nonS != 0 {
+		t.Fatalf("全部 S 级时非 S 待检数应为 0，实际 %d", nonS)
+	}
+	// 不跳过时必须能取到批次，否则健康检查会整轮空转
+	batch, err := s.GetBatchForHealthCheck(20, false, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 3 {
+		t.Fatalf("不跳过 S 级时应取到 3 条，实际 %d", len(batch))
+	}
+}
+
+func TestHealthCheckCoversRowsAboveSelectionThreshold(t *testing.T) {
+	s := newTestStorage(t)
+	addr := "9.9.9.9:1080"
+	if err := s.AddProxyWithSource(addr, "socks5", "free"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetStatus(addr, "degraded"); err != nil {
+		t.Fatal(err)
+	}
+	// fail_count = 4：已被"选择"排除（<3），但还没到失败阈值 5
+	for i := 0; i < 4; i++ {
+		if err := s.IncrementFailCount(addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch, err := s.GetBatchForHealthCheck(20, false, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch) != 1 || batch[0].Address != addr {
+		t.Fatalf("fail_count=4 的行必须仍被健康检查覆盖（否则成为僵尸行），实际 %+v", batch)
+	}
+
+	// 达到阈值后被兜底清扫删除
+	if err := s.IncrementFailCount(addr); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.DeleteInvalid(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("达阈值应被清扫，实际清理 %d", n)
+	}
+	if total, _ := s.CountAll(); total != 0 {
+		t.Fatalf("清扫后不应残留，实际 %d", total)
+	}
+}
+
 func TestDeleteStalePending(t *testing.T) {
 	s := newTestStorage(t)
 	if err := s.AddProxyWithSource("7.7.7.7:1080", "socks5", "free"); err != nil {

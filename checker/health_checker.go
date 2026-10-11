@@ -45,10 +45,26 @@ func failureOutcome(failCount, threshold int) (status string, remove bool) {
 	return "", true
 }
 
+// sweepInvalid 兜底清扫：把达到失败阈值的僵尸行清掉。
+// 这些行既不被"选择"（fail_count < 3）也不被"检查"（旧查询同样过滤 fail_count < 3），
+// 会永久留在库里占位并污染统计（实测 150 行里有 47 行处于这种状态）。
+func (hc *HealthChecker) sweepInvalid() {
+	threshold := hc.cfg.FailureThreshold
+	if threshold <= 0 {
+		threshold = 5
+	}
+	if n, err := hc.storage.DeleteInvalid(threshold); err == nil && n > 0 {
+		log.Printf("[health] 🧹 清理达失败阈值(%d)的代理: %d 个", threshold, n)
+	}
+}
+
 // RunOnce 执行一次健康检查
 func (hc *HealthChecker) RunOnce() {
 	start := time.Now()
 	log.Println("[health] 开始健康检查...")
+
+	// 每轮先做兜底清扫（否则僵尸行会一直堆积）
+	hc.sweepInvalid()
 
 	// 获取池子状态
 	status, err := hc.poolMgr.GetStatus()
@@ -57,17 +73,23 @@ func (hc *HealthChecker) RunOnce() {
 		return
 	}
 
-	// 健康状态且S级占比高时，跳过S级代理检查
-	skipSGrade := status.State == "healthy"
+	// 是否跳过 S 级检查：必须同时满足"池子健康"+"非 S 级待检够一批"。
+	// 旧逻辑只看 S 级占比 > 0.3 就跳过 —— 当整池都是 S 级时（实测发生过），
+	// 健康检查会每轮空转（"无需检查的代理"），池子彻底失去管理。
+	skipSGrade := false
 	dist, _ := hc.storage.GetQualityDistribution()
 	sGradeCount := dist["S"]
 	totalCount := status.Total
-	if totalCount > 0 && float64(sGradeCount)/float64(totalCount) > 0.3 {
+	nonSCheckable, _ := hc.storage.CountCheckable(true, hc.cfg.FailureThreshold)
+	if status.State == "healthy" && totalCount > 0 &&
+		float64(sGradeCount)/float64(totalCount) > 0.3 &&
+		nonSCheckable >= hc.cfg.HealthCheckBatchSize {
 		skipSGrade = true
 	}
 
-	// 批量获取需要检查的代理
-	proxies, err := hc.storage.GetBatchForHealthCheck(hc.cfg.HealthCheckBatchSize, skipSGrade)
+	// 批量获取需要检查的代理（上界用 FailureThreshold：介于选择阈值与失败阈值之间的
+	// 代理仍要被检查，否则既不被选择也不被检查，成为永远清不掉的僵尸行）
+	proxies, err := hc.storage.GetBatchForHealthCheck(hc.cfg.HealthCheckBatchSize, skipSGrade, hc.cfg.FailureThreshold)
 	if err != nil {
 		log.Printf("[health] 获取检查批次失败: %v", err)
 		return
@@ -75,6 +97,7 @@ func (hc *HealthChecker) RunOnce() {
 
 	if len(proxies) == 0 {
 		log.Println("[health] 无需检查的代理")
+		hc.sweepInvalid()
 		hc.reanimateDisabled()
 		return
 	}

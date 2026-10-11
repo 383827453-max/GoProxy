@@ -673,10 +673,14 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 }
 
 // GetBatchForHealthCheck 获取一批需要健康检查的代理
-func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Proxy, error) {
+func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool, maxFailCount int) ([]Proxy, error) {
+	if maxFailCount <= 0 {
+		maxFailCount = 3
+	}
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3`
+		 WHERE status IN ('active', 'degraded') AND fail_count < ?`
+	args := []any{maxFailCount}
 
 	if skipSGrade {
 		query += ` AND quality_grade != 'S'`
@@ -686,8 +690,9 @@ func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Prox
 		COALESCE(last_check, '1970-01-01') ASC,
 		quality_grade DESC
 		LIMIT ?`
+	args = append(args, batchSize)
 
-	rows, err := s.db.Query(query, batchSize)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -702,6 +707,23 @@ func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Prox
 		proxies = append(proxies, *p)
 	}
 	return proxies, nil
+}
+
+// CountCheckable 统计"可被健康检查覆盖"的代理数量。
+// 用于决定是否跳过 S 级检查：只有当非 S 级待检数量足够一批时才可以跳过，
+// 否则（例如整池都是 S 级）跳过会导致健康检查整轮空转、池子进入无人管理状态。
+func (s *Storage) CountCheckable(skipSGrade bool, maxFailCount int) (int, error) {
+	if maxFailCount <= 0 {
+		maxFailCount = 3
+	}
+	query := `SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND fail_count < ?`
+	args := []any{maxFailCount}
+	if skipSGrade {
+		query += ` AND quality_grade != 'S'`
+	}
+	var n int
+	err := s.db.QueryRow(query, args...).Scan(&n)
+	return n, err
 }
 
 // CalculateQualityGrade 根据延迟计算质量等级
@@ -719,12 +741,28 @@ func CalculateQualityGrade(latencyMs int) string {
 }
 
 // DeleteInvalid 删除失败次数超过阈值的代理（仅免费代理）
+// DeleteInvalid 清理达到失败阈值的代理：免费代理删除，订阅代理禁用（保留探测唤醒）。
+//
+// 关键：这些行若只靠"选择/健康检查"两条路径处理，会因为两边都带 fail_count < N 过滤
+// 而变成永久僵尸行（既不被选择、也不被检查、也不会被删）。所以必须有这条兜底清扫。
 func (s *Storage) DeleteInvalid(maxFailCount int) (int64, error) {
+	if maxFailCount <= 0 {
+		maxFailCount = 3
+	}
 	res, err := s.db.Exec(`DELETE FROM proxies WHERE fail_count >= ? AND source = 'free'`, maxFailCount)
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	deleted, _ := res.RowsAffected()
+
+	res2, err := s.db.Exec(
+		`UPDATE proxies SET status = 'disabled' WHERE fail_count >= ? AND source = 'custom' AND status != 'disabled'`,
+		maxFailCount)
+	if err != nil {
+		return deleted, err
+	}
+	disabled, _ := res2.RowsAffected()
+	return deleted + disabled, nil
 }
 
 // DeleteBlockedCountries 删除指定国家代码出口的代理

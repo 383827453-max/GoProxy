@@ -48,12 +48,30 @@ func (o *Optimizer) RunOnce() {
 		return
 	}
 
+	// 没有"慢代理"可换时就别跑了：一轮优化要验证上万个候选（实测耗时 1h41m），
+	// 白白占用验证预算并和补池/健康检查抢出口查询额度。
+	worstHTTP, _ := o.storage.GetWorstProxies("http", 1)
+	worstSOCKS, _ := o.storage.GetWorstProxies("socks5", 1)
+	slow := func(list []storage.Proxy) bool {
+		return len(list) > 0 && list[0].Latency > o.cfg.MaxLatencyHealthy
+	}
+	if !slow(worstHTTP) && !slow(worstSOCKS) {
+		log.Printf("[optimize] 池内无慢代理（阈值 %dms），跳过本轮优化", o.cfg.MaxLatencyHealthy)
+		return
+	}
+
 	// 抓取新的候选代理（优化模式）
 	log.Println("[optimize] 抓取新候选代理...")
 	candidates, err := o.fetcher.FetchSmart("optimize", "")
 	if err != nil {
 		log.Printf("[optimize] 抓取失败: %v", err)
 		return
+	}
+
+	// 候选上限：优化只需要少量优质替代品，验证上万个候选会把一轮拉到小时级
+	if max := o.cfg.OptimizeMaxCandidates; max > 0 && len(candidates) > max {
+		log.Printf("[optimize] 候选 %d 个，按上限截断到 %d 个", len(candidates), max)
+		candidates = candidates[:max]
 	}
 
 	log.Printf("[optimize] 抓取到 %d 个候选代理", len(candidates))
